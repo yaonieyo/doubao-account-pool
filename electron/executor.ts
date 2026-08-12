@@ -7,6 +7,8 @@ import {
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
+  doubaoVideoModelFromText,
+  doubaoVideoModelLabel,
   getNewDoubaoVideoUrls,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
@@ -263,6 +265,14 @@ export class DoubaoExecutor {
         message: "正在填写提示词"
       });
       await fillPrompt(win, request.prompt);
+
+      const selectedBeforeSubmit = await inspectSelectedVideoModel(win);
+      const requestedModel = request.model === "seedance_2_0_mini" ? "mini" : "fast";
+      if (selectedBeforeSubmit.currentModel !== requestedModel) {
+        throw new Error(
+          `发送前模型校验失败：要求 ${doubaoVideoModelLabel(requestedModel)}，当前为 ${selectedBeforeSubmit.currentModel ? doubaoVideoModelLabel(selectedBeforeSubmit.currentModel) : "未识别"}`
+        );
+      }
 
       await this.updateProgress({
         requestId,
@@ -708,13 +718,137 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
 }
 
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
-  const target = model === "seedance_2_0_mini" ? "Mini" : "Fast";
+  const target = model === "seedance_2_0_mini" ? "mini" : "fast";
+  const targetLabel = doubaoVideoModelLabel(target);
   await clickByKeywords(win, ["视频生成"]);
-  await wait(800);
-  await clickByKeywords(win, ["Seedance", "模型", "model"]);
-  await wait(500);
-  await clickByKeywords(win, [target, model === "seedance_2_0_mini" ? "mini" : "fast"]);
-  await wait(500);
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await wait(700 + attempt * 250);
+    const current = await inspectSelectedVideoModel(win);
+    if (current.currentModel === target) return;
+
+    const opened = await clickDoubaoModelTrigger(win);
+    if (!opened) {
+      await clickByKeywords(win, ["Seedance", "模型", "model"]);
+    }
+    await wait(500);
+    if (!await clickExactDoubaoModelOption(win, target)) {
+      continue;
+    }
+    await wait(800 + attempt * 200);
+    const selected = await inspectSelectedVideoModel(win);
+    if (selected.currentModel === target) return;
+  }
+
+  const state = await inspectSelectedVideoModel(win);
+  throw new Error(
+    `豆包模型未确认：要求 ${targetLabel}，当前为 ${state.currentModel ? doubaoVideoModelLabel(state.currentModel) : "未识别"}`
+  );
+}
+
+async function inspectSelectedVideoModel(win: BrowserWindow) {
+  return runPageScript<{
+    currentModel: "mini" | "fast" | null;
+    labels: string[];
+  }>(win, `
+    (() => {
+      const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [aria-selected], [aria-checked], [aria-pressed], [aria-haspopup]'))
+        .filter(visible)
+        .map((el) => ({
+          el,
+          text: textOf(el),
+          model: modelFromText(textOf(el)),
+          selected: el.getAttribute("aria-selected") === "true"
+            || el.getAttribute("aria-checked") === "true"
+            || el.getAttribute("aria-pressed") === "true"
+        }))
+        .filter((item) => item.model);
+      const selected = nodes.filter((item) => item.selected).sort((a, b) => a.text.length - b.text.length)[0];
+      const trigger = nodes
+        .filter((item) => item.el.tagName === "BUTTON"
+          || item.el.getAttribute("role") === "button"
+          || item.el.hasAttribute("aria-haspopup"))
+        .sort((a, b) => a.text.length - b.text.length)[0];
+      const pageModels = (document.body?.innerText || "")
+        .split(/\\n+/)
+        .map((line) => modelFromText(line.trim()))
+        .filter(Boolean);
+      const fallback = pageModels.length === 1 ? pageModels[0] : null;
+      return {
+        currentModel: selected?.model || trigger?.model || fallback || null,
+        labels: nodes.map((item) => item.text).slice(0, 12)
+      };
+    })()
+  `);
+}
+
+async function clickDoubaoModelTrigger(win: BrowserWindow) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-haspopup], [tabindex]'))
+        .filter(visible)
+        .map((el) => ({ el, text: textOf(el), model: modelFromText(textOf(el)) }))
+        .filter((item) => item.model)
+        .sort((a, b) => a.text.length - b.text.length);
+      const target = candidates[0]?.el;
+      if (!target) return false;
+      target.click();
+      return true;
+    })()
+  `);
+}
+
+async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "fast") {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const target = ${JSON.stringify(model)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [tabindex], [aria-label]'))
+        .filter(visible)
+        .map((el) => ({ el, text: textOf(el), model: modelFromText(textOf(el)) }))
+        .filter((item) => item.model === target)
+        .sort((a, b) => a.text.length - b.text.length);
+      const option = candidates[0]?.el;
+      if (!option) return false;
+      option.click();
+      return true;
+    })()
+  `);
 }
 
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {

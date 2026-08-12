@@ -19,7 +19,7 @@ const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
 const operationLogs = ref<OperationLog[]>([]);
 const apiStatus = ref<ApiServerStatus>({
-  version: "0.1.30",
+  version: "0.1.35",
   enabled: false,
   running: false,
   port: 0,

@@ -3,6 +3,8 @@ import test from 'node:test'
 
 import {
   containsPromptSignature,
+  doubaoVideoModelFromText,
+  doubaoVideoModelLabel,
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
   extractDoubaoShareUrl,
@@ -46,6 +48,15 @@ test('matches the current prompt by normalized signature', () => {
   assert.equal(promptSignature(prompt).length > 10, true)
   assert.equal(containsPromptSignature(composerText, prompt), true)
   assert.equal(containsPromptSignature('搜索：其他历史对话', prompt), false)
+})
+
+test('identifies the requested Seedance model instead of inheriting Fast', () => {
+  assert.equal(doubaoVideoModelLabel('mini'), 'Seedance 2.0 Mini')
+  assert.equal(doubaoVideoModelFromText('Seedance 2.0 Mini'), 'mini')
+  assert.equal(doubaoVideoModelFromText('Seedance 2.0 Fast'), 'fast')
+  assert.equal(doubaoVideoModelFromText('Mini'), 'mini')
+  assert.equal(doubaoVideoModelFromText('Fast'), 'fast')
+  assert.equal(doubaoVideoModelFromText('Seedance 2.0 Mini Fast'), null)
 })
 
 test('accepts only new HTTP video links for the current generation', () => {

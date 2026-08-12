@@ -2,6 +2,21 @@ export function normalizeComparableText(value: string) {
   return value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
 }
 
+export type DoubaoVideoModelName = "mini" | "fast";
+
+export function doubaoVideoModelLabel(model: DoubaoVideoModelName) {
+  return model === "mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
+}
+
+export function doubaoVideoModelFromText(value: string | null | undefined): DoubaoVideoModelName | null {
+  const text = String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const compact = text.replace(/[^a-z0-9]+/g, "");
+  const hasMini = compact.includes("seedance20mini") || /(?:^|\s)mini(?:\s|$)/.test(text);
+  const hasFast = compact.includes("seedance20fast") || /(?:^|\s)fast(?:\s|$)/.test(text);
+  if (hasMini === hasFast) return null;
+  return hasMini ? "mini" : "fast";
+}
+
 const DOUBAO_SHARE_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/(?:thread|chat|share)\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
 const DOUBAO_CONVERSATION_URL_RE = /https?:\/\/(?:www\.)?doubao\.com\/chat\/[A-Za-z0-9._~-]+(?:[\/?#][^\s"'<>]*)?/i;
 
