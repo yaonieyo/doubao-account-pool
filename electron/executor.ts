@@ -730,11 +730,15 @@ async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
     const opened = await clickDoubaoModelTrigger(win);
     if (!opened) {
       await clickByKeywords(win, ["Seedance", "模型", "model"]);
+    } else {
+      await sendMouseClick(win, opened.x, opened.y);
     }
     await wait(500);
-    if (!await clickExactDoubaoModelOption(win, target)) {
+    const option = await clickExactDoubaoModelOption(win, target);
+    if (!option) {
       continue;
     }
+    await sendMouseClick(win, option.x, option.y);
     await wait(800 + attempt * 200);
     const selected = await inspectSelectedVideoModel(win);
     if (selected.currentModel === target) return;
@@ -764,7 +768,7 @@ async function inspectSelectedVideoModel(win: BrowserWindow) {
         el.getAttribute("aria-label"),
         el.getAttribute("title")
       ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [aria-selected], [aria-checked], [aria-pressed], [aria-haspopup]'))
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [aria-selected], [aria-checked], [aria-pressed], [aria-haspopup], [data-state]'))
         .filter(visible)
         .map((el) => ({
           el,
@@ -773,13 +777,18 @@ async function inspectSelectedVideoModel(win: BrowserWindow) {
           selected: el.getAttribute("aria-selected") === "true"
             || el.getAttribute("aria-checked") === "true"
             || el.getAttribute("aria-pressed") === "true"
+            || /checked|selected|active|on/i.test(el.getAttribute("data-state") || "")
+            || /selected|active|checked/.test(String(el.className || "").toLowerCase())
         }))
         .filter((item) => item.model);
-      const selected = nodes.filter((item) => item.selected).sort((a, b) => a.text.length - b.text.length)[0];
+      const selected = nodes
+        .filter((item) => item.selected)
+        .sort((a, b) => a.text.length - b.text.length)[0];
       const trigger = nodes
         .filter((item) => item.el.tagName === "BUTTON"
           || item.el.getAttribute("role") === "button"
           || item.el.hasAttribute("aria-haspopup"))
+        .filter((item) => !item.el.closest('[role="option"], [role="menuitem"], [role="listbox"]'))
         .sort((a, b) => a.text.length - b.text.length)[0];
       const pageModels = (document.body?.innerText || "")
         .split(/\\n+/)
@@ -795,7 +804,7 @@ async function inspectSelectedVideoModel(win: BrowserWindow) {
 }
 
 async function clickDoubaoModelTrigger(win: BrowserWindow) {
-  return runPageScript<boolean>(win, `
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
       const modelFromText = ${doubaoVideoModelFromText.toString()};
       const visible = (el) => {
@@ -811,19 +820,32 @@ async function clickDoubaoModelTrigger(win: BrowserWindow) {
       ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
       const candidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-haspopup], [tabindex]'))
         .filter(visible)
-        .map((el) => ({ el, text: textOf(el), model: modelFromText(textOf(el)) }))
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            el,
+            text: textOf(el),
+            model: modelFromText(textOf(el)),
+            rect,
+            optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]'))
+          };
+        })
         .filter((item) => item.model)
+        .filter((item) => !item.optionLike)
         .sort((a, b) => a.text.length - b.text.length);
-      const target = candidates[0]?.el;
-      if (!target) return false;
-      target.click();
-      return true;
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
     })()
   `);
 }
 
 async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "fast") {
-  return runPageScript<boolean>(win, `
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
       const modelFromText = ${doubaoVideoModelFromText.toString()};
       const target = ${JSON.stringify(model)};
@@ -840,13 +862,27 @@ async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "
       ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
       const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [tabindex], [aria-label]'))
         .filter(visible)
-        .map((el) => ({ el, text: textOf(el), model: modelFromText(textOf(el)) }))
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            el,
+            text: textOf(el),
+            model: modelFromText(textOf(el)),
+            rect,
+            optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]')),
+            hasPopup: el.hasAttribute("aria-haspopup")
+          };
+        })
         .filter((item) => item.model === target)
-        .sort((a, b) => a.text.length - b.text.length);
-      const option = candidates[0]?.el;
-      if (!option) return false;
-      option.click();
-      return true;
+        .filter((item) => item.optionLike || !item.hasPopup)
+        .sort((a, b) => Number(b.optionLike) - Number(a.optionLike) || a.text.length - b.text.length);
+      const option = candidates[0];
+      if (!option) return null;
+      return {
+        x: Math.round(option.rect.left + option.rect.width / 2),
+        y: Math.round(option.rect.top + option.rect.height / 2),
+        debug: option.text
+      };
     })()
   `);
 }

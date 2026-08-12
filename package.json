@@ -1,6 +1,6 @@
 {
   "name": "doubao-account-manager",
-  "version": "0.1.35",
+  "version": "0.1.36",
   "description": "豆包多账号隔离登录、额度调度和本地视频生成接口服务",
   "main": "dist-electron/main.js",
   "type": "module",
