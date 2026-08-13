@@ -1,6 +1,6 @@
 {
   "name": "doubao-account-manager",
-  "version": "0.1.36",
+  "version": "0.1.38",
   "description": "豆包多账号隔离登录、额度调度和本地视频生成接口服务",
   "main": "dist-electron/main.js",
   "type": "module",
@@ -37,7 +37,7 @@
   },
   "build": {
     "afterPack": "scripts/after-pack.cjs",
-    "appId": "com.local.doubao-account-manager",
+    "appId": "com.local.doubao-account-manager.latest",
     "productName": "豆包账号池接口服务",
     "directories": {
       "output": "release"
@@ -48,6 +48,7 @@
       "package.json"
     ],
     "mac": {
+      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"

@@ -59,6 +59,12 @@ export function isDoubaoGenerationComplete(pageText: string) {
   return /你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(text);
 }
 
+export function isDoubaoGenerationPending(pageText: string) {
+  const text = pageText.replace(/\s+/g, " ").trim();
+  if (!text || extractDoubaoFailureMessage(text) || isDoubaoGenerationComplete(text)) return false;
+  return /正在为您生成一段|视频生成中|视频生成已提交/.test(text);
+}
+
 const GENERATION_COMPLETE_PATTERNS = [
   /你的视频(?:已经|已)?生成好[了啦]/g,
   /视频(?:已经|已)?生成(?:完成|成功|好[了啦])/g,
@@ -137,6 +143,91 @@ export function extractDoubaoFailureMessage(pageText: string) {
   }
 
   return null;
+}
+
+export function extractNewDoubaoReply(currentText: string, baselineText: string, prompt: string) {
+  const normalize = (value: string) => value.replace(/[^\p{L}\p{N}]+/gu, "").trim();
+  const replyNoise = new Set([
+    "AI 生成可能有误 注意核实",
+    "快速",
+    "视频生成",
+    "图像生成",
+    "帮我写作",
+    "PPT 生成",
+    "翻译",
+    "深入研究",
+    "录音转写",
+    "记录会议",
+    "音乐生成",
+    "更多"
+  ]);
+  const lines = (value: string) => value
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const baselineCounts = new Map<string, number>();
+  for (const line of lines(baselineText)) {
+    baselineCounts.set(line, (baselineCounts.get(line) || 0) + 1);
+  }
+
+  const promptLines = new Set(lines(prompt));
+  const promptFragments = Array.from(promptLines)
+    .map(normalize)
+    .filter((fragment) => fragment.length >= 6);
+  const normalizedPrompt = normalize(prompt);
+  const signature = normalizedPrompt.slice(0, Math.min(42, Math.max(12, normalizedPrompt.length)));
+  const currentLines = lines(currentText);
+  const disclaimerIndex = currentLines.lastIndexOf("AI 生成可能有误 注意核实");
+  const scopedLines = disclaimerIndex >= 0 ? currentLines.slice(disclaimerIndex + 1) : currentLines;
+  const additions: string[] = [];
+  for (const line of scopedLines) {
+    const remaining = baselineCounts.get(line) || 0;
+    if (remaining > 0) {
+      baselineCounts.set(line, remaining - 1);
+      continue;
+    }
+    if (promptLines.has(line) || replyNoise.has(line)) continue;
+    const normalizedLine = normalize(line);
+    if (signature && normalizedLine.includes(signature)) continue;
+    if (promptFragments.some((fragment) => normalizedLine.includes(fragment))) continue;
+    if (/^(搜索|新对话|新工作任务|AI 创作|云盘|技能|项目|创建新项目|最近|主对话|下载电脑版)$/.test(line)) continue;
+    if (line.length < 2) continue;
+    additions.push(line);
+  }
+
+  if (!additions.length) return null;
+  return additions.slice(-6).join(" ").slice(0, 600);
+}
+
+export function isDoubaoCongestionReply(value: string | null | undefined) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return /这会儿有点热闹|需要一点时间处理这个任务|当前请求较多|服务繁忙|系统繁忙|稍后再试/.test(text);
+}
+
+export function hasNewDoubaoSubmissionConfirmation(
+  currentText: string,
+  baselineText: string,
+  modelLabel: string
+) {
+  const countOccurrences = (text: string, needle: string) => {
+    let count = 0;
+    let index = 0;
+    while (true) {
+      index = text.indexOf(needle, index);
+      if (index === -1) return count;
+      count += 1;
+      index += needle.length;
+    }
+  };
+  const confirmations = [
+    `本次使用 ${modelLabel} 生成`,
+    "正在为您生成一段",
+    "视频生成中",
+    "视频生成已提交"
+  ];
+  return confirmations.some((confirmation) => (
+    countOccurrences(currentText, confirmation) > countOccurrences(baselineText, confirmation)
+  ));
 }
 
 export function countTextOccurrences(text: string, needle: string) {

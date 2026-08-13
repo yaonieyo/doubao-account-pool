@@ -7,13 +7,17 @@ import {
   doubaoVideoModelLabel,
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
+  extractNewDoubaoReply,
   extractDoubaoShareUrl,
   getNewDoubaoVideoUrls,
+  hasNewDoubaoSubmissionConfirmation,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
   isDoubaoDesktopDownloadPrompt,
   isDoubaoGenerationComplete,
+  isDoubaoGenerationPending,
+  isDoubaoCongestionReply,
   isDoubaoPromptRewritePage,
   isGenerationReadyForShare,
   isQuotaNotChargedFailure,
@@ -31,6 +35,60 @@ test('detects Doubao infringement and violation failures', () => {
 test('detects common generation failure text', () => {
   assert.equal(extractDoubaoFailureMessage('视频生成失败，请稍后再试。'), '视频生成失败，请稍后再试。')
   assert.equal(extractDoubaoFailureMessage('你的视频免费额度还有 2 次。'), null)
+})
+
+test('keeps submitted or generating videos pending without hiding failures', () => {
+  assert.equal(isDoubaoGenerationPending('正在为您生成一段 10 秒的视频，视频生成中，视频生成已提交'), true)
+  assert.equal(isDoubaoGenerationPending('你的视频已经生成好了。'), false)
+  assert.equal(
+    isDoubaoGenerationPending('视频生成中，生成内容中疑似包含侵权 / 违规内容，无法返回该内容，生成额度未扣除。'),
+    false
+  )
+})
+
+test('extracts the new Doubao reply instead of returning the whole page', () => {
+  const prompt = '生成一段 10 秒科普动画。\n画面比例：16:9。'
+  const baseline = `豆包\n新对话\n${prompt}\n快速\n视频生成\n更多`
+  const current = `${baseline}\n女性健康科普动画\nAI 生成可能有误 注意核实\n生成视频：${prompt}，10s\n这会儿有点热闹，我需要一点时间处理这个任务，别着急。`
+
+  assert.equal(
+    extractNewDoubaoReply(current, baseline, prompt),
+    '这会儿有点热闹，我需要一点时间处理这个任务，别着急。'
+  )
+})
+
+test('recognizes Doubao congestion replies', () => {
+  assert.equal(isDoubaoCongestionReply('这会儿有点热闹，我需要一点时间处理这个任务，别着急。'), true)
+  assert.equal(isDoubaoCongestionReply('当前请求较多，请稍后再试。'), true)
+  assert.equal(isDoubaoCongestionReply('本次使用 Seedance 2.0 Mini 生成。'), false)
+})
+
+test('accepts both Doubao submission confirmation variants', () => {
+  const baseline = '新对话 视频生成'
+  assert.equal(
+    hasNewDoubaoSubmissionConfirmation(
+      `${baseline} 本次使用 Seedance 2.0 Mini 生成，视频生成好后会主动发送给你。`,
+      baseline,
+      'Seedance 2.0 Mini'
+    ),
+    true
+  )
+  assert.equal(
+    hasNewDoubaoSubmissionConfirmation(
+      `${baseline} 正在为您生成一段 10 秒的科普动画视频... 视频生成中 视频生成已提交`,
+      baseline,
+      'Seedance 2.0 Mini'
+    ),
+    true
+  )
+  assert.equal(
+    hasNewDoubaoSubmissionConfirmation(
+      `${baseline} 这会儿有点热闹，我需要一点时间处理这个任务。`,
+      baseline,
+      'Seedance 2.0 Mini'
+    ),
+    false
+  )
 })
 
 test('detects the exhausted daily free generation quota message', () => {

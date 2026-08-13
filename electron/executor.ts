@@ -6,15 +6,19 @@ import { AccountTaskScheduler } from "./account-scheduler.js";
 import {
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
+  extractNewDoubaoReply,
   extractDoubaoShareUrl,
   doubaoVideoModelFromText,
   doubaoVideoModelLabel,
   getNewDoubaoVideoUrls,
+  hasNewDoubaoSubmissionConfirmation,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
   hasNewTextOccurrence,
   isDoubaoDesktopDownloadPrompt,
+  isDoubaoCongestionReply,
   isDoubaoGenerationComplete,
+  isDoubaoGenerationPending,
   isDoubaoPromptRewritePage,
   isGenerationReadyForShare,
   isQuotaNotChargedFailure,
@@ -37,6 +41,8 @@ type ShareRecoveryResult = {
   candidateCount: number;
   promptMatchCount: number;
   generatedMatchCount: number;
+  pendingMatchCount: number;
+  failureMessage: string | null;
   shareFailureReason: string | null;
 };
 
@@ -49,6 +55,20 @@ class DoubaoPageFailureError extends Error {
   constructor(message: string, readonly refundQuota: boolean) {
     super(message);
     this.name = "DoubaoPageFailureError";
+  }
+}
+
+class DoubaoCongestionError extends DoubaoPageFailureError {
+  constructor(readonly reply: string) {
+    super(`豆包繁忙，未确认视频生成；页面最新回复：${reply}`, true);
+    this.name = "DoubaoCongestionError";
+  }
+}
+
+class DoubaoGenerationPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DoubaoGenerationPendingError";
   }
 }
 
@@ -152,8 +172,29 @@ export class DoubaoExecutor {
         request.doubaoThreadUrl
       );
       if (!recovery.shareUrl) {
+        if (recovery.failureMessage) {
+          const shouldRefund = isQuotaNotChargedFailure(recovery.failureMessage)
+            && !request.message.includes("已退回预扣额度");
+          if (shouldRefund) this.database.refundQuota(account.id, request.model);
+          await this.failRequest(
+            request,
+            `豆包已返回视频生成失败：${recovery.failureMessage}`,
+            shouldRefund
+          );
+          this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+          return;
+        }
+        if (recovery.pendingMatchCount > 0) {
+          await this.updateProgress({
+            requestId,
+            status: "accepted",
+            message: "豆包仍在后台生成视频，尚未返回完成结果；稍后可手动恢复结果，不会重新提交"
+          });
+          this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+          return;
+        }
         throw new Error(
-          `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
+          `未找到可恢复的豆包视频：历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，确认已生成 ${recovery.generatedMatchCount} 条，仍在生成 ${recovery.pendingMatchCount} 条，仍未复制到分享链接${recovery.shareFailureReason ? `（${recovery.shareFailureReason}）` : ""}`
         );
       }
       this.recordOperation(
@@ -243,44 +284,71 @@ export class DoubaoExecutor {
         throw new Error("豆包账号未登录，已打开登录窗口，请登录后重试");
       }
 
-      await this.updateProgress({
-        requestId,
-        status: "running",
-        message: "正在切换豆包视频生成模式"
-      });
-      await activateVideoMode(win, request.model);
-
-      if (request.referenceImagePath) {
+      const prepareSubmission = async (attempt: number) => {
         await this.updateProgress({
           requestId,
           status: "running",
-          message: "正在上传参考图"
+          message: attempt === 1
+            ? "正在切换豆包视频生成模式"
+            : `豆包繁忙，正在进行第 ${attempt}/3 次提交`
         });
-        await uploadReferenceImage(win, request.referenceImagePath);
+        await activateVideoMode(win!, request.model);
+
+        if (request.referenceImagePath) {
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: attempt === 1 ? "正在上传参考图" : "正在重新上传参考图"
+          });
+          await uploadReferenceImage(win!, request.referenceImagePath);
+        }
+
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: attempt === 1 ? "正在填写提示词" : "正在重新填写提示词"
+        });
+        await fillPrompt(win!, request.prompt);
+
+        const selectedBeforeSubmit = await inspectSelectedVideoModel(win!);
+        const requestedModel = request.model === "seedance_2_0_mini" ? "mini" : "fast";
+        if (selectedBeforeSubmit.currentModel !== requestedModel) {
+          throw new Error(
+            `发送前模型校验失败：要求 ${doubaoVideoModelLabel(requestedModel)}，当前为 ${selectedBeforeSubmit.currentModel ? doubaoVideoModelLabel(selectedBeforeSubmit.currentModel) : "未识别"}`
+          );
+        }
+      };
+
+      let generationBaseline!: Awaited<ReturnType<typeof inspectGenerationPage>>;
+      for (let submissionAttempt = 1; submissionAttempt <= 3; submissionAttempt += 1) {
+        await prepareSubmission(submissionAttempt);
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: submissionAttempt === 1
+            ? "正在提交豆包生成"
+            : `正在重试提交豆包生成（${submissionAttempt}/3）`
+        });
+        generationBaseline = await inspectGenerationPage(win);
+        try {
+          await submitPromptAndWait(win, request.model, request.prompt);
+          break;
+        } catch (error) {
+          if (!(error instanceof DoubaoCongestionError) || submissionAttempt >= 3) {
+            throw error;
+          }
+          const delaySeconds = submissionAttempt === 1 ? 10 : 30;
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: `豆包返回繁忙提示：${error.reply}；${delaySeconds} 秒后自动重试`
+          });
+          await wait(delaySeconds * 1000);
+          await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
+          await wait(2500);
+          await dismissDoubaoDesktopDownloadPrompt(win);
+        }
       }
-
-      await this.updateProgress({
-        requestId,
-        status: "running",
-        message: "正在填写提示词"
-      });
-      await fillPrompt(win, request.prompt);
-
-      const selectedBeforeSubmit = await inspectSelectedVideoModel(win);
-      const requestedModel = request.model === "seedance_2_0_mini" ? "mini" : "fast";
-      if (selectedBeforeSubmit.currentModel !== requestedModel) {
-        throw new Error(
-          `发送前模型校验失败：要求 ${doubaoVideoModelLabel(requestedModel)}，当前为 ${selectedBeforeSubmit.currentModel ? doubaoVideoModelLabel(selectedBeforeSubmit.currentModel) : "未识别"}`
-        );
-      }
-
-      await this.updateProgress({
-        requestId,
-        status: "running",
-        message: "正在提交豆包生成"
-      });
-      const generationBaseline = await inspectGenerationPage(win);
-      await submitPromptAndWait(win, request.model, request.prompt);
       submittedToDoubao = true;
       const submittedConversationUrl = await waitForSubmittedConversationUrl(win);
       if (submittedConversationUrl) {
@@ -357,6 +425,17 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
+      if (error instanceof DoubaoGenerationPendingError) {
+        await this.updateProgress({
+          requestId,
+          status: "accepted",
+          message: `${error.message}；稍后可手动恢复结果，不会重新提交`
+        });
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        this.onDataChanged();
+        if (win && !win.isDestroyed()) win.close();
+        return;
+      }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
       if (shouldRefundQuota) {
         this.database.refundQuota(account.id, request.model);
@@ -888,7 +967,7 @@ async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "
 }
 
 async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
-  const baselineText = await getPageText(win);
+  const baselineText = await getRawPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
     {
       label: "Enter",
@@ -938,7 +1017,22 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
         isQuotaNotChargedFailure(result.failureMessage)
       );
     }
-    if (result.confirmed || result.sentEvidence) return;
+    if (result.confirmed) return;
+    if (result.responseMessage) {
+      if (isDoubaoCongestionReply(result.responseMessage)) {
+        throw new DoubaoCongestionError(result.responseMessage);
+      }
+      throw new DoubaoPageFailureError(
+        `豆包没有确认视频生成；页面最新回复：${result.responseMessage}`,
+        true
+      );
+    }
+    if (result.sentEvidence) {
+      throw new DoubaoPageFailureError(
+        "提示词已发送，但豆包没有返回视频生成确认，也没有识别到新的回复文字",
+        true
+      );
+    }
   }
 
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
@@ -1092,11 +1186,14 @@ async function waitForSubmissionStarted(
 ) {
   const modelLabel = model === "seedance_2_0_mini" ? "Seedance 2.0 Mini" : "Seedance 2.0 Fast";
   const startedAt = Date.now();
+  let sentEvidenceSeen = false;
+  let latestResponseMessage: string | null = null;
   while (Date.now() - startedAt < timeoutMs) {
     const state = await runPageScript<{
       confirmed: boolean;
       sentEvidence: boolean;
       failureMessage: string | null;
+      responseMessage: string | null;
       pageTextExcerpt: string;
     }>(win, `
       (() => {
@@ -1104,14 +1201,16 @@ async function waitForSubmissionStarted(
         const baselineText = ${JSON.stringify(baselineText)};
         const prompt = ${JSON.stringify(prompt)};
         const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
+        const extractNewDoubaoReply = ${extractNewDoubaoReply.toString()};
+        const hasNewDoubaoSubmissionConfirmation = ${hasNewDoubaoSubmissionConfirmation.toString()};
         const hasNewPromptOccurrence = ${hasNewPromptOccurrence.toString()};
         const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
-        const pageText = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
-        const expected = "本次使用 " + modelLabel + " 生成";
+        const pageText = (document.body?.innerText || "").trim();
         const failureMessage = extractDoubaoFailureMessage(pageText);
         const newFailureMessage = failureMessage && hasNewTextOccurrence(pageText, baselineText, failureMessage)
           ? failureMessage
           : null;
+        const responseMessage = extractNewDoubaoReply(pageText, baselineText, prompt);
         const visible = (el) => {
           const rect = el.getBoundingClientRect();
           const style = getComputedStyle(el);
@@ -1135,29 +1234,32 @@ async function waitForSubmissionStarted(
           && pageChanged
           && (hasNewPromptOccurrence(pageText, baselineText, prompt) || composerCleared);
         return {
-          confirmed: hasNewTextOccurrence(pageText, baselineText, expected)
-            && pageText.includes("视频生成好后")
-            && pageText.includes("本次生成将消耗每日免费额度"),
+          confirmed: hasNewDoubaoSubmissionConfirmation(pageText, baselineText, modelLabel),
           sentEvidence,
           failureMessage: newFailureMessage,
+          responseMessage,
           pageTextExcerpt: pageText.slice(-500)
         };
       })()
     `);
 
     if (state.failureMessage) {
-      return { confirmed: false, sentEvidence: false, failureMessage: state.failureMessage };
+      return { confirmed: false, sentEvidence: false, failureMessage: state.failureMessage, responseMessage: null };
     }
     if (state.confirmed) {
-      return { confirmed: true, sentEvidence: true, failureMessage: null };
+      return { confirmed: true, sentEvidence: true, failureMessage: null, responseMessage: null };
     }
-    if (state.sentEvidence) {
-      return { confirmed: false, sentEvidence: true, failureMessage: null };
-    }
+    sentEvidenceSeen ||= state.sentEvidence;
+    latestResponseMessage = state.responseMessage || latestResponseMessage;
     await wait(1000);
   }
 
-  return { confirmed: false, sentEvidence: false, failureMessage: null };
+  return {
+    confirmed: false,
+    sentEvidence: sentEvidenceSeen,
+    failureMessage: null,
+    responseMessage: latestResponseMessage
+  };
 }
 
 interface GenerationPageState {
@@ -1302,6 +1404,15 @@ async function waitForGenerationResult(
   if (recovery.generatedMatchCount > 0) {
     return { shareUrl: null, directVideoUrl, shareFailureReason: recovery.shareFailureReason };
   }
+  if (recovery.failureMessage) {
+    throw new DoubaoPageFailureError(
+      `豆包已返回视频生成失败：${recovery.failureMessage}`,
+      isQuotaNotChargedFailure(recovery.failureMessage)
+    );
+  }
+  if (recovery.pendingMatchCount > 0) {
+    throw new DoubaoGenerationPendingError("等待时间已到，但豆包页面仍明确显示视频生成中");
+  }
   throw new Error(
     `等待豆包视频生成超时；历史链接 ${recovery.candidateCount} 条，提示词匹配 ${recovery.promptMatchCount} 条，未找到已生成视频`
   );
@@ -1426,6 +1537,8 @@ async function findGeneratedConversationAndCopyShare(
   const requiredSignatureMatches = Math.max(1, Math.ceil(signatures.length * 0.8));
   let promptMatchCount = 0;
   let generatedMatchCount = 0;
+  let pendingMatchCount = 0;
+  let failureMessage: string | null = null;
   let shareFailureReason: string | null = null;
 
   for (const candidate of orderedCandidates) {
@@ -1455,7 +1568,14 @@ async function findGeneratedConversationAndCopyShare(
     promptMatchCount += 1;
 
     const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
-    if (!pageState.generated || pageState.failed) continue;
+    if (pageState.failureMessage) {
+      failureMessage ||= pageState.failureMessage;
+      continue;
+    }
+    if (!pageState.generated) {
+      if (isDoubaoGenerationPending(pageState.pageText)) pendingMatchCount += 1;
+      continue;
+    }
     if (pageState.videoCardCount <= 0) {
       shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
       continue;
@@ -1471,6 +1591,8 @@ async function findGeneratedConversationAndCopyShare(
           candidateCount: orderedCandidates.length,
           promptMatchCount,
           generatedMatchCount,
+          pendingMatchCount,
+          failureMessage,
           shareFailureReason: null
         };
       }
@@ -1483,6 +1605,8 @@ async function findGeneratedConversationAndCopyShare(
     candidateCount: orderedCandidates.length,
     promptMatchCount,
     generatedMatchCount,
+    pendingMatchCount,
+    failureMessage,
     shareFailureReason
   };
 }
@@ -2208,6 +2332,10 @@ async function runPageScript<T>(win: BrowserWindow, script: string) {
 
 async function getPageText(win: BrowserWindow) {
   return runPageScript<string>(win, `(document.body?.innerText || "").replace(/\\s+/g, " ").trim()`);
+}
+
+async function getRawPageText(win: BrowserWindow) {
+  return runPageScript<string>(win, `(document.body?.innerText || "").trim()`);
 }
 
 function errorMessage(error: unknown) {
