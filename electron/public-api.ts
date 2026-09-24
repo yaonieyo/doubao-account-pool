@@ -6,8 +6,10 @@ export function toPublicApiRequest(request: ApiRequest) {
     status: request.status,
     message: request.message,
     model: request.model,
+    aspectRatio: request.aspectRatio,
     cleanVideoUrl: request.cleanVideoUrl,
     outputVideoPath: request.outputVideoPath,
+    quotaRefunded: request.quotaRefunded,
     createdAt: request.createdAt,
     updatedAt: request.updatedAt,
     finishedAt: request.finishedAt

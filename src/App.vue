@@ -17,9 +17,10 @@ type TabKey = "accounts" | "settings" | "logs" | "actions";
 
 const accounts = ref<Account[]>([]);
 const apiRequests = ref<ApiRequest[]>([]);
+const todayGeneratedCount = ref(0);
 const operationLogs = ref<OperationLog[]>([]);
 const apiStatus = ref<ApiServerStatus>({
-  version: "0.1.38",
+  version: "0.1.65",
   enabled: false,
   running: false,
   port: 0,
@@ -214,15 +215,21 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-  const [accountRows, settings, status, requests, actions] = await Promise.all([
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
+  const [accountRows, settings, status, requests, actions, generatedCount] = await Promise.all([
     window.doubaoManager.accounts.list(),
     window.doubaoManager.settings.get(),
     window.doubaoManager.apiServer.status(),
     window.doubaoManager.apiRequests.list(100),
-    window.doubaoManager.operationLogs.list(500)
+    window.doubaoManager.operationLogs.list(500),
+    window.doubaoManager.apiRequests.todaySuccessCount(dayStart.toISOString(), dayEnd.toISOString())
   ]);
   accounts.value = accountRows;
   apiRequests.value = requests;
+  todayGeneratedCount.value = generatedCount;
   operationLogs.value = actions;
   apiStatus.value = status;
   Object.assign(settingsForm, settings);
@@ -333,6 +340,18 @@ async function restartApiServer() {
 async function clearLogs() {
   if (!window.confirm("清空接口日志？")) return;
   await window.doubaoManager.apiRequests.clear();
+  await refresh();
+}
+
+function canStopRequest(item: ApiRequest) {
+  return item.status === "accepted" || item.status === "running";
+}
+
+async function stopRequest(item: ApiRequest) {
+  const warning = "终止任务并退回本地预扣额度？\n\n任务会立即退出本地队列并释放账号。如果已经提交到豆包，豆包平台上的生成无法撤回。";
+  if (!window.confirm(warning)) return;
+  await window.doubaoManager.apiRequests.stop(item.requestId);
+  if (selectedRequest.value?.requestId === item.requestId) closeRequestDetails();
   await refresh();
 }
 
@@ -582,6 +601,10 @@ onBeforeUnmount(() => {
         <div role="listitem" class="overview-success">
           <span>可用账号</span>
           <strong>{{ accountOverview.available }}</strong>
+        </div>
+        <div role="listitem" class="overview-success" title="仅统计今天已取得真实视频结果的成功任务">
+          <span>今日已生成</span>
+          <strong>{{ todayGeneratedCount }} 个</strong>
         </div>
         <div role="listitem" :class="{ 'overview-warning': accountOverview.exhausted > 0 }">
           <span>今日额度耗尽</span>
@@ -909,6 +932,14 @@ onBeforeUnmount(() => {
                 <span class="result-indicator" :class="{ ready: resultValue(item) !== '-' }">
                   {{ resultLabel(item) }}
                 </span>
+                <button
+                  v-if="canStopRequest(item)"
+                  class="icon-button danger log-stop-button"
+                  type="button"
+                  @click="stopRequest(item)"
+                >
+                  终止并退还
+                </button>
                 <button class="icon-button log-detail-button" type="button" @click="openRequestDetails(item)">
                   查看详情
                 </button>
@@ -1002,7 +1033,17 @@ onBeforeUnmount(() => {
             <h2 id="request-detail-title">请求详情</h2>
             <p>{{ selectedRequest.requestId }}</p>
           </div>
-          <button class="icon-button" type="button" @click="closeRequestDetails">关闭</button>
+          <div class="request-detail-actions">
+            <button
+              v-if="canStopRequest(selectedRequest)"
+              class="button danger"
+              type="button"
+              @click="stopRequest(selectedRequest)"
+            >
+              终止并退还积分
+            </button>
+            <button class="icon-button" type="button" @click="closeRequestDetails">关闭</button>
+          </div>
         </div>
 
         <dl class="request-detail-grid">

@@ -80,6 +80,7 @@ export class AppDatabase {
         request_id TEXT NOT NULL UNIQUE,
         source TEXT NOT NULL DEFAULT 'local',
         model TEXT NOT NULL,
+        aspect_ratio TEXT NOT NULL DEFAULT '16:9',
         account_id INTEGER,
         status TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
@@ -91,6 +92,8 @@ export class AppDatabase {
         raw_video_url TEXT,
         clean_video_url TEXT,
         output_video_path TEXT,
+        quota_cost INTEGER NOT NULL DEFAULT 0,
+        quota_refunded INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         finished_at TEXT,
@@ -398,6 +401,7 @@ export class AppDatabase {
         api_requests.request_id AS requestId,
         api_requests.source,
         api_requests.model,
+        api_requests.aspect_ratio AS aspectRatio,
         api_requests.account_id AS accountId,
         accounts.name AS accountName,
         accounts.partition AS accountPartition,
@@ -411,6 +415,7 @@ export class AppDatabase {
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
+        api_requests.quota_refunded AS quotaRefunded,
         api_requests.created_at AS createdAt,
         api_requests.updated_at AS updatedAt,
         api_requests.finished_at AS finishedAt
@@ -421,6 +426,22 @@ export class AppDatabase {
     `).all(limit).map(normalizeApiRequest);
   }
 
+  countSuccessfulVideosBetween(startIso: string, endIso: string): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM api_requests
+      WHERE status = 'success'
+        AND finished_at >= ?
+        AND finished_at < ?
+        AND (
+          (clean_video_url IS NOT NULL AND TRIM(clean_video_url) <> '')
+          OR LOWER(COALESCE(output_video_path, '')) LIKE '%.mp4'
+        )
+    `).get(startIso, endIso) as { count: number };
+
+    return Number(row.count || 0);
+  }
+
   getApiRequest(requestId: string): ApiRequest | undefined {
     const row = this.db.prepare(`
       SELECT
@@ -428,6 +449,7 @@ export class AppDatabase {
         api_requests.request_id AS requestId,
         api_requests.source,
         api_requests.model,
+        api_requests.aspect_ratio AS aspectRatio,
         api_requests.account_id AS accountId,
         accounts.name AS accountName,
         accounts.partition AS accountPartition,
@@ -441,6 +463,7 @@ export class AppDatabase {
         api_requests.raw_video_url AS rawVideoUrl,
         api_requests.clean_video_url AS cleanVideoUrl,
         api_requests.output_video_path AS outputVideoPath,
+        api_requests.quota_refunded AS quotaRefunded,
         api_requests.created_at AS createdAt,
         api_requests.updated_at AS updatedAt,
         api_requests.finished_at AS finishedAt
@@ -458,6 +481,7 @@ export class AppDatabase {
         request_id,
         source,
         model,
+        aspect_ratio,
         account_id,
         status,
         message,
@@ -465,15 +489,17 @@ export class AppDatabase {
         reference_image_path,
         remove_watermark,
         callback_url,
+        quota_cost,
         created_at,
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
       input.model,
+      input.aspectRatio || "16:9",
       input.accountId ?? null,
       input.status,
       input.message || "",
@@ -481,6 +507,7 @@ export class AppDatabase {
       input.referenceImagePath || null,
       input.removeWatermark === false ? 0 : 1,
       input.callbackUrl || null,
+      Math.max(0, clampInt(input.quotaCost || 0)),
       timestamp,
       timestamp,
       input.status === "failed" || input.status === "success" || input.status === "stopped" ? timestamp : null
@@ -496,6 +523,94 @@ export class AppDatabase {
       WHERE request_id = ?
     `).run(status, message, now(), finishedAt, requestId);
     return this.getApiRequest(requestId)!;
+  }
+
+  stopApiRequestAndRefund(requestId: string): { request: ApiRequest; stopped: boolean; refunded: boolean } {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT request_id AS requestId, status, account_id AS accountId, model,
+               message, quota_cost AS quotaCost, quota_refunded AS quotaRefunded
+        FROM api_requests
+        WHERE request_id = ?
+      `).get(requestId) as {
+        requestId: string;
+        status: ApiRequestStatus;
+        accountId: number | null;
+        model: DoubaoModel;
+        message: string;
+        quotaCost: number;
+        quotaRefunded: number;
+      } | undefined;
+
+      if (!row) throw new Error("Request not found");
+      if (row.status !== "accepted" && row.status !== "running") {
+        return { request: this.getApiRequest(requestId)!, stopped: false, refunded: false };
+      }
+
+      const settings = this.getSettings();
+      const fallbackCost = row.model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+      const cost = row.quotaCost > 0 ? row.quotaCost : fallbackCost;
+      const alreadyRefunded = Boolean(row.quotaRefunded) || row.message.includes("已退回预扣额度");
+      const refunded = Boolean(row.accountId) && !alreadyRefunded;
+      const timestamp = now();
+
+      if (refunded) {
+        this.db.prepare(`
+          UPDATE accounts
+          SET quota_remaining = MIN(daily_quota_limit, quota_remaining + ?),
+              quota_used_today = MAX(0, quota_used_today - ?),
+              current_status = 'idle',
+              updated_at = ?
+          WHERE id = ?
+        `).run(cost, cost, timestamp, row.accountId);
+      } else if (row.accountId) {
+        this.db.prepare(`UPDATE accounts SET current_status = 'idle', updated_at = ? WHERE id = ?`)
+          .run(timestamp, row.accountId);
+      }
+
+      const message = refunded
+        ? `用户已终止任务，已退回预扣 ${cost} 额度`
+        : "用户已终止任务，预扣额度此前已退回或该任务未预扣额度";
+      this.db.prepare(`
+        UPDATE api_requests
+        SET status = 'stopped', message = ?, quota_refunded = ?, updated_at = ?, finished_at = ?
+        WHERE request_id = ?
+      `).run(message, refunded || alreadyRefunded ? 1 : 0, timestamp, timestamp, requestId);
+
+      return { request: this.getApiRequest(requestId)!, stopped: true, refunded };
+    })();
+  }
+
+  refundApiRequestQuota(requestId: string): boolean {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT account_id AS accountId, model, quota_cost AS quotaCost,
+               quota_refunded AS quotaRefunded, message
+        FROM api_requests WHERE request_id = ?
+      `).get(requestId) as {
+        accountId: number | null;
+        model: DoubaoModel;
+        quotaCost: number;
+        quotaRefunded: number;
+        message: string;
+      } | undefined;
+      if (!row?.accountId || row.quotaRefunded || row.message.includes("已退回预扣额度")) return false;
+
+      const settings = this.getSettings();
+      const fallbackCost = row.model === "seedance_2_0_mini" ? settings.miniCost : settings.fastCost;
+      const cost = row.quotaCost > 0 ? row.quotaCost : fallbackCost;
+      const timestamp = now();
+      this.db.prepare(`
+        UPDATE accounts
+        SET quota_remaining = MIN(daily_quota_limit, quota_remaining + ?),
+            quota_used_today = MAX(0, quota_used_today - ?),
+            updated_at = ?
+        WHERE id = ?
+      `).run(cost, cost, timestamp, row.accountId);
+      this.db.prepare(`UPDATE api_requests SET quota_refunded = 1, updated_at = ? WHERE request_id = ?`)
+        .run(timestamp, requestId);
+      return true;
+    })();
   }
 
   updateApiRequest(input: ApiRequestUpdateInput) {
@@ -658,6 +773,7 @@ export class AppDatabase {
 
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
+    this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT NOT NULL DEFAULT '16:9'");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
@@ -665,6 +781,8 @@ export class AppDatabase {
     this.addColumnIfMissing("api_requests", "raw_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "clean_video_url", "TEXT");
     this.addColumnIfMissing("api_requests", "output_video_path", "TEXT");
+    this.addColumnIfMissing("api_requests", "quota_cost", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("api_requests", "quota_refunded", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("api_requests", "finished_at", "TEXT");
   }
 
@@ -736,10 +854,15 @@ function isSettingsKey(key: string): key is keyof AppSettings {
 }
 
 function normalizeApiRequest(row: unknown): ApiRequest {
-  const request = row as ApiRequest & { removeWatermark: number | boolean };
+  const request = row as ApiRequest & {
+    removeWatermark: number | boolean;
+    quotaRefunded: number | boolean;
+  };
   return {
     ...request,
-    removeWatermark: Boolean(request.removeWatermark)
+    aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
+    removeWatermark: Boolean(request.removeWatermark),
+    quotaRefunded: Boolean(request.quotaRefunded)
   };
 }
 

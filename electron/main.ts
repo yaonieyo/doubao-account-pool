@@ -14,6 +14,7 @@ import type {
   ApiServerStatus,
   AppSettings,
   AppSettingsUpdateInput,
+  DoubaoAspectRatio,
   DoubaoModel,
   GenerateRequestBody
 } from "./types.js";
@@ -148,6 +149,13 @@ class LocalApiServer {
           return;
         }
 
+        const aspectRatio = normalizeAspectRatio(body.aspectRatio) || "16:9";
+        const rawAspectRatio = typeof body.aspectRatio === "string" ? body.aspectRatio.trim() : body.aspectRatio;
+        if (rawAspectRatio !== undefined && rawAspectRatio !== null && rawAspectRatio !== "" && !normalizeAspectRatio(body.aspectRatio)) {
+          sendJson(response, 400, { error: "aspectRatio must be 9:16 or 16:9" });
+          return;
+        }
+
         const referenceImagePath = await prepareReferenceImage(body, requestId);
         const account = settings.executorEnabled
           ? this.database.reserveAvailableAccount(model)
@@ -159,6 +167,7 @@ class LocalApiServer {
             requestId,
             source: body.source,
             model,
+            aspectRatio,
             status: "failed",
             message: "没有可用账号，或该模型剩余额度不足",
             prompt,
@@ -183,6 +192,7 @@ class LocalApiServer {
           requestId,
           source: body.source,
           model,
+          aspectRatio,
           accountId: account.id,
           status: "accepted",
           message: settings.executorEnabled
@@ -191,7 +201,8 @@ class LocalApiServer {
           prompt,
           referenceImagePath,
           removeWatermark: true,
-          callbackUrl: body.callbackUrl
+          callbackUrl: body.callbackUrl,
+          quotaCost: cost
         });
         if (settings.executorEnabled) {
           this.requestExecutor.enqueue(created.requestId);
@@ -234,6 +245,21 @@ class LocalApiServer {
           status: "accepted",
           message: "已进入结果恢复队列，不会重新提交视频生成"
         });
+        return;
+      }
+
+      const stopMatch = requestUrl.pathname.match(/^\/api\/requests\/([^/]+)\/stop$/);
+      if (request.method === "POST" && stopMatch) {
+        const requestId = decodeURIComponent(stopMatch[1]);
+        const result = this.requestExecutor.stop(requestId);
+        if (!result.stopped) {
+          sendJson(response, 409, {
+            ...toPublicApiRequest(result.request),
+            error: "only accepted or running requests can be stopped"
+          });
+          return;
+        }
+        sendJson(response, 200, toPublicApiRequest(result.request));
         return;
       }
 
@@ -438,6 +464,10 @@ function registerIpc() {
   ipcMain.handle("api-server:restart", async () => apiServer.applySettings(db.getSettings()));
 
   ipcMain.handle("api-requests:list", (_event, limit?: number) => db.listApiRequests(limit || 100));
+  ipcMain.handle("api-requests:stop", (_event, requestId: string) => executor.stop(requestId));
+  ipcMain.handle("api-requests:today-success-count", (_event, startIso: string, endIso: string) =>
+    db.countSuccessfulVideosBetween(startIso, endIso)
+  );
   ipcMain.handle("api-requests:clear", () => {
     db.clearApiRequests();
     return true;
@@ -467,6 +497,13 @@ function notifyDataChanged() {
 
 function normalizeModel(model: string): DoubaoModel | null {
   if (model === "seedance_2_0_mini" || model === "seedance_2_0_fast") return model;
+  return null;
+}
+
+function normalizeAspectRatio(value: unknown): DoubaoAspectRatio | null {
+  if (value === undefined || value === null || value === "") return null;
+  const normalized = String(value).replace(/\s+/g, "").trim();
+  if (normalized === "9:16" || normalized === "16:9") return normalized;
   return null;
 }
 
@@ -538,6 +575,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
 
   return {
     model: fields.model as DoubaoModel | undefined,
+    aspectRatio: fields.aspectRatio || null,
     prompt: fields.prompt || "",
     referenceImagePath: uploadedReferenceImagePath || fields.referenceImagePath || null,
     referenceImageUrl: fields.referenceImageUrl || null,

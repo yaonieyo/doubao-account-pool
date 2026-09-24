@@ -475,7 +475,7 @@ pre {
 
 .account-overview {
   display: grid;
-  grid-template-columns: repeat(4, minmax(90px, 1fr)) minmax(150px, 1.35fr) repeat(2, minmax(100px, 1fr));
+  grid-template-columns: repeat(5, minmax(82px, 1fr)) minmax(145px, 1.3fr) repeat(2, minmax(92px, 1fr));
   margin-bottom: 14px;
   border: 1px solid #e1e5eb;
   border-radius: 8px;
@@ -965,6 +965,17 @@ pre {
   background: #f8fafc;
 }
 
+.log-stop-button {
+  margin-top: 5px;
+  margin-right: 5px;
+}
+
+.request-detail-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .operation-logs-table {
   min-width: 1280px;
 }
@@ -1120,7 +1131,7 @@ pre {
 
 @media (max-width: 1250px) {
   .account-overview {
-    grid-template-columns: repeat(4, minmax(85px, 1fr)) minmax(135px, 1.3fr) repeat(2, minmax(92px, 1fr));
+    grid-template-columns: repeat(5, minmax(76px, 1fr)) minmax(130px, 1.25fr) repeat(2, minmax(85px, 1fr));
   }
 
   .account-overview > div {

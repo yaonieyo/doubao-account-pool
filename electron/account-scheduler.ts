@@ -7,6 +7,7 @@ export class AccountTaskScheduler<T extends AccountTask> {
   private readonly pending: T[] = [];
   private readonly activeKeys = new Set<string>();
   private readonly activeAccountIds = new Set<number>();
+  private readonly activeAccountByKey = new Map<string, number>();
   private draining = false;
 
   constructor(
@@ -24,6 +25,26 @@ export class AccountTaskScheduler<T extends AccountTask> {
     return true;
   }
 
+  cancel(key: string) {
+    const index = this.pending.findIndex((item) => item.key === key);
+    if (index >= 0) {
+      this.pending.splice(index, 1);
+      return true;
+    }
+
+    const accountId = this.activeAccountByKey.get(key);
+    if (accountId === undefined) return false;
+    this.activeKeys.delete(key);
+    this.activeAccountIds.delete(accountId);
+    this.activeAccountByKey.delete(key);
+    this.drain();
+    return true;
+  }
+
+  isActive(key: string) {
+    return this.activeKeys.has(key);
+  }
+
   private drain() {
     if (this.draining) return;
     this.draining = true;
@@ -38,13 +59,16 @@ export class AccountTaskScheduler<T extends AccountTask> {
         const [item] = this.pending.splice(nextIndex, 1);
         this.activeKeys.add(item.key);
         this.activeAccountIds.add(item.accountId);
+        this.activeAccountByKey.set(item.key, item.accountId);
 
         void Promise.resolve()
           .then(() => this.worker(item))
           .catch((error) => this.onWorkerError(error))
           .finally(() => {
+            const activeAccountId = this.activeAccountByKey.get(item.key);
             this.activeKeys.delete(item.key);
-            this.activeAccountIds.delete(item.accountId);
+            this.activeAccountByKey.delete(item.key);
+            if (activeAccountId !== undefined) this.activeAccountIds.delete(activeAccountId);
             this.drain();
           });
       }

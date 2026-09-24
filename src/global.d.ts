@@ -33,6 +33,8 @@ declare global {
       };
       apiRequests: {
         list: (limit?: number) => Promise<ApiRequest[]>;
+        todaySuccessCount: (startIso: string, endIso: string) => Promise<number>;
+        stop: (requestId: string) => Promise<{ request: ApiRequest; stopped: boolean; refunded: boolean }>;
         clear: () => Promise<boolean>;
       };
       operationLogs: {

@@ -24,6 +24,9 @@ const api = {
   },
   apiRequests: {
     list: (limit?: number) => ipcRenderer.invoke("api-requests:list", limit),
+    todaySuccessCount: (startIso: string, endIso: string) =>
+      ipcRenderer.invoke("api-requests:today-success-count", startIso, endIso),
+    stop: (requestId: string) => ipcRenderer.invoke("api-requests:stop", requestId),
     clear: () => ipcRenderer.invoke("api-requests:clear")
   },
   operationLogs: {

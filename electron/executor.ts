@@ -7,10 +7,14 @@ import {
   extractDoubaoConversationUrl,
   extractDoubaoFailureMessage,
   extractNewDoubaoReply,
-  extractDoubaoShareUrl,
+  extractDoubaoWatermarkShareUrl,
+  doubaoAspectRatioFromText,
+  isDoubaoAspectRatioTriggerText,
   doubaoVideoModelFromText,
   doubaoVideoModelLabel,
+  isDoubaoVideoModelTriggerText,
   getNewDoubaoVideoUrls,
+  hasStrongSubmissionEvidence,
   hasNewDoubaoSubmissionConfirmation,
   hasNewGenerationCompletion,
   hasNewPromptOccurrence,
@@ -18,14 +22,18 @@ import {
   isDoubaoDesktopDownloadPrompt,
   isDoubaoCongestionReply,
   isDoubaoGenerationComplete,
+  isDoubaoGenerationActionText,
   isDoubaoGenerationPending,
+  isDoubaoPromptSuggestion,
   isDoubaoPromptRewritePage,
+  isDoubaoSafetyConfirmationDialog,
   isGenerationReadyForShare,
+  isFormalDoubaoConversationUrl,
   isQuotaNotChargedFailure,
   normalizeComparableText
 } from "./doubao-page-state.js";
 import { toPublicApiRequest } from "./public-api.js";
-import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoModel } from "./types.js";
+import type { Account, ApiRequest, ApiRequestStatus, AppSettings, DoubaoAspectRatio, DoubaoModel } from "./types.js";
 import { resolveCleanVideoUrl, verifyDoubaoShareVideoResource } from "./watermark.js";
 
 type DataChangedCallback = () => void;
@@ -72,36 +80,28 @@ class DoubaoGenerationPendingError extends Error {
   }
 }
 
-class AsyncMutex {
-  private tail = Promise.resolve();
-
-  async runExclusive<T>(operation: () => Promise<T>) {
-    const previous = this.tail;
-    let release!: () => void;
-    this.tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
+class DoubaoTaskStoppedError extends Error {
+  constructor() {
+    super("任务已由用户终止");
+    this.name = "DoubaoTaskStoppedError";
   }
 }
 
-// Electron's clipboard is process-wide. Serializing share-copy operations prevents
-// parallel account windows from overwriting each other's sentinel or copied URL.
-const clipboardMutex = new AsyncMutex();
 const SHARE_PANEL_WAIT_MS = 3500;
-const CLIPBOARD_WAIT_MS = 2800;
+const PAGE_SHARE_CAPTURE_WAIT_MS = 2800;
 const CALLBACK_TIMEOUT_MS = 5000;
 const VIDEO_CARD_WAIT_MS = 15000;
+const DIRECT_GENERATION_FOLLOW_UP = "请直接提交视频生成，不要改写、分析或扩写提示词。";
+const DIRECT_GENERATION_SHORT_FOLLOW_UP = "直接生成";
+const DIRECT_GENERATION_CONFIRM_FOLLOW_UP = "确认生成";
+const PREFERRED_CONVERSATION_RETRY_MS = 75000;
+const RECENT_CONVERSATION_FALLBACK_LIMIT = 10;
 const callbackQueues = new Map<string, Promise<void>>();
 
 export class DoubaoExecutor {
   private readonly scheduler: AccountTaskScheduler<QueueItem>;
+  private readonly stoppedRequestIds = new Set<string>();
+  private readonly executionWindows = new Map<string, BrowserWindow>();
 
   constructor(
     private readonly database: AppDatabase,
@@ -110,10 +110,15 @@ export class DoubaoExecutor {
     this.scheduler = new AccountTaskScheduler(
       () => this.database.getSettings().maxConcurrentAccounts,
       async (item) => {
-        if (item.mode === "recover") {
-          await this.recoverResult(item.requestId);
-        } else {
-          await this.execute(item.requestId);
+        try {
+          if (item.mode === "recover") {
+            await this.recoverResult(item.requestId);
+          } else {
+            await this.execute(item.requestId);
+          }
+        } finally {
+          this.stoppedRequestIds.delete(item.requestId);
+          this.executionWindows.delete(item.requestId);
         }
       },
       (error) => console.error("豆包并行执行器异常", error)
@@ -126,6 +131,33 @@ export class DoubaoExecutor {
 
   enqueueRecovery(requestId: string) {
     this.enqueueItem(requestId, "recover");
+  }
+
+  stop(requestId: string) {
+    const request = this.database.getApiRequest(requestId);
+    if (!request) throw new Error("Request not found");
+    if (request.status !== "accepted" && request.status !== "running") {
+      return { request, stopped: false, refunded: false };
+    }
+
+    const wasActive = this.scheduler.isActive(requestId);
+    this.stoppedRequestIds.add(requestId);
+    const win = this.executionWindows.get(requestId);
+    if (win && !win.isDestroyed()) win.close();
+
+    const result = this.database.stopApiRequestAndRefund(requestId);
+    this.scheduler.cancel(requestId);
+    this.database.appendOperationLog({
+      requestId,
+      accountId: result.request.accountId,
+      action: "终止任务",
+      status: "success",
+      message: result.request.message
+    });
+    this.onDataChanged();
+    void postCallback(result.request);
+    if (!wasActive) this.stoppedRequestIds.delete(requestId);
+    return result;
   }
 
   private enqueueItem(requestId: string, mode: QueueItem["mode"]) {
@@ -157,7 +189,7 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
-      win = this.createExecutionWindow(account, settings);
+      win = this.createExecutionWindow(account, settings, requestId);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -169,13 +201,16 @@ export class DoubaoExecutor {
       const recovery = await findGeneratedConversationAndCopyShare(
         win,
         request.prompt,
-        request.doubaoThreadUrl
+        request.doubaoThreadUrl,
+        async (message) => {
+          await this.updateProgress({ requestId, status: "running", message });
+        }
       );
       if (!recovery.shareUrl) {
         if (recovery.failureMessage) {
           const shouldRefund = isQuotaNotChargedFailure(recovery.failureMessage)
             && !request.message.includes("已退回预扣额度");
-          if (shouldRefund) this.database.refundQuota(account.id, request.model);
+          if (shouldRefund) this.database.refundApiRequestQuota(requestId);
           await this.failRequest(
             request,
             `豆包已返回视频生成失败：${recovery.failureMessage}`,
@@ -201,7 +236,7 @@ export class DoubaoExecutor {
         requestId,
         "复制分享地址",
         "success",
-        "已复制并确认豆包分享页包含视频资源",
+        "已复制豆包 thread/share 地址，等待去水印接口验证真实 MP4",
         recovery.shareUrl
       );
       const resolvedVideo = await this.resolveCleanVideoForVerifiedShare(
@@ -226,6 +261,10 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "idle" });
     } catch (error) {
+      if (this.isStopped(requestId, error)) {
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        return;
+      }
       const message = errorMessage(error);
       await this.failRequest(request, `恢复结果失败：${message}`, false);
       this.database.updateAccount({
@@ -266,7 +305,7 @@ export class DoubaoExecutor {
       });
       this.database.updateAccount({ id: account.id, currentStatus: "busy" });
 
-      win = this.createExecutionWindow(account, settings);
+      win = this.createExecutionWindow(account, settings, requestId);
       await loadUrl(win, settings.doubaoChatUrl || "https://www.doubao.com/chat");
       await wait(2500);
       await dismissDoubaoDesktopDownloadPrompt(win);
@@ -293,6 +332,28 @@ export class DoubaoExecutor {
             : `豆包繁忙，正在进行第 ${attempt}/3 次提交`
         });
         await activateVideoMode(win!, request.model);
+
+        if (request.aspectRatio) {
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: `正在设置豆包画幅：${request.aspectRatio}`
+          });
+          const aspectRatioResult = await selectDoubaoAspectRatio(win!, request.aspectRatio);
+          await this.updateProgress({
+            requestId,
+            status: "running",
+            message: aspectRatioResult.attempts > 0
+              ? `豆包画幅已确认：${aspectRatioResult.before || "未识别"} -> ${aspectRatioResult.after}（第 ${aspectRatioResult.attempts} 次）`
+              : `豆包画幅已确认：${aspectRatioResult.after}`
+          });
+        }
+
+        await this.updateProgress({
+          requestId,
+          status: "running",
+          message: formatGenerationSettings(request)
+        });
 
         if (request.referenceImagePath) {
           await this.updateProgress({
@@ -331,7 +392,14 @@ export class DoubaoExecutor {
         });
         generationBaseline = await inspectGenerationPage(win);
         try {
-          await submitPromptAndWait(win, request.model, request.prompt);
+          await submitPromptAndWait(
+            win,
+            request.model,
+            request.prompt,
+            async (message) => {
+              await this.updateProgress({ requestId, status: "running", message });
+            }
+          );
           break;
         } catch (error) {
           if (!(error instanceof DoubaoCongestionError) || submissionAttempt >= 3) {
@@ -390,7 +458,7 @@ export class DoubaoExecutor {
         requestId,
         "复制分享地址",
         "success",
-        "已复制并确认豆包分享页包含视频资源",
+        "已复制豆包 thread/share 地址，等待去水印接口验证真实 MP4",
         generationResult.shareUrl
       );
 
@@ -425,6 +493,10 @@ export class DoubaoExecutor {
         win.close();
       }
     } catch (error) {
+      if (this.isStopped(requestId, error)) {
+        this.database.updateAccount({ id: account.id, currentStatus: "idle" });
+        return;
+      }
       if (error instanceof DoubaoGenerationPendingError) {
         await this.updateProgress({
           requestId,
@@ -438,7 +510,7 @@ export class DoubaoExecutor {
       }
       const shouldRefundQuota = !submittedToDoubao || isRefundableExecutionError(error);
       if (shouldRefundQuota) {
-        this.database.refundQuota(account.id, request.model);
+        this.database.refundApiRequestQuota(requestId);
       }
       await this.failRequest(request, errorMessage(error), shouldRefundQuota);
       this.database.updateAccount({
@@ -453,6 +525,10 @@ export class DoubaoExecutor {
   }
 
   private async updateProgress(input: Parameters<AppDatabase["updateApiRequest"]>[0]) {
+    const current = this.database.getApiRequest(input.requestId);
+    if (this.stoppedRequestIds.has(input.requestId) || current?.status === "stopped") {
+      throw new DoubaoTaskStoppedError();
+    }
     const updated = this.database.updateApiRequest(input);
     this.database.appendOperationLog({
       requestId: updated.requestId,
@@ -552,13 +628,14 @@ export class DoubaoExecutor {
     });
   }
 
-  private createExecutionWindow(account: Account, settings: AppSettings) {
+  private createExecutionWindow(account: Account, settings: AppSettings, requestId: string) {
     const titleName = account.remark || account.name;
-    return new BrowserWindow({
+    const windowTitle = `豆包执行器 - ${titleName} - ${requestId.replace(/^doubao-/, "").slice(0, 6)}`;
+    const win = new BrowserWindow({
       width: 1320,
       height: 860,
       show: settings.showExecutorWindow,
-      title: `豆包执行器 - ${titleName}`,
+      title: windowTitle,
       webPreferences: {
         partition: account.partition,
         contextIsolation: true,
@@ -567,6 +644,23 @@ export class DoubaoExecutor {
         backgroundThrottling: false
       }
     });
+    win.on("page-title-updated", (event) => {
+      event.preventDefault();
+      win.setTitle(windowTitle);
+    });
+    this.executionWindows.set(requestId, win);
+    win.once("closed", () => {
+      if (this.executionWindows.get(requestId) === win) {
+        this.executionWindows.delete(requestId);
+      }
+    });
+    return win;
+  }
+
+  private isStopped(requestId: string, error: unknown) {
+    return error instanceof DoubaoTaskStoppedError
+      || this.stoppedRequestIds.has(requestId)
+      || this.database.getApiRequest(requestId)?.status === "stopped";
   }
 }
 
@@ -799,83 +893,174 @@ async function setComposerTextDirectly(win: BrowserWindow, prompt: string) {
 async function activateVideoMode(win: BrowserWindow, model: DoubaoModel) {
   const target = model === "seedance_2_0_mini" ? "mini" : "fast";
   const targetLabel = doubaoVideoModelLabel(target);
-  await clickByKeywords(win, ["视频生成"]);
+  const diagnostics: string[] = [];
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
-    await wait(700 + attempt * 250);
-    const current = await inspectSelectedVideoModel(win);
+    await sendKeyboard(win, "Escape", undefined, 150);
+    let current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 800);
     if (current.currentModel === target) return;
+
+    if (attempt === 2 && !current.currentModel) {
+      const freshConversation = await findExactDoubaoActionPoint(win, "新对话");
+      if (freshConversation) {
+        await sendMouseClick(win, freshConversation.x, freshConversation.y);
+        diagnostics.push("已重置到新对话");
+        await wait(1200);
+      }
+    }
+
+    if (!current.currentModel) {
+      const videoMode = await findExactDoubaoActionPoint(win, "视频生成", true);
+      if (videoMode) {
+        await sendMouseClick(win, videoMode.x, videoMode.y);
+        diagnostics.push(`第 ${attempt} 次点击视频入口 ${videoMode.debug}`);
+        current = await waitForDoubaoVideoModelState(win, (state) => Boolean(state.currentModel), 3200);
+        if (current.currentModel === target) return;
+      } else {
+        diagnostics.push(`第 ${attempt} 次未找到视频生成入口`);
+      }
+    }
+
+    if (!current.currentModel) {
+      diagnostics.push(`第 ${attempt} 次点击后仍未出现视频模型工具栏`);
+      continue;
+    }
 
     const opened = await clickDoubaoModelTrigger(win);
     if (!opened) {
-      await clickByKeywords(win, ["Seedance", "模型", "model"]);
+      diagnostics.push(`第 ${attempt} 次未找到模型入口`);
+      continue;
     } else {
       await sendMouseClick(win, opened.x, opened.y);
+      diagnostics.push(`第 ${attempt} 次点击模型入口 ${opened.debug}`);
     }
-    await wait(500);
-    const option = await clickExactDoubaoModelOption(win, target);
+    const option = await waitForDoubaoVideoModelOption(win, target, 2600);
     if (!option) {
+      diagnostics.push(`第 ${attempt} 次模型菜单未找到 ${targetLabel}`);
       continue;
     }
     await sendMouseClick(win, option.x, option.y);
-    await wait(800 + attempt * 200);
-    const selected = await inspectSelectedVideoModel(win);
+    const selected = await waitForDoubaoVideoModelState(win, (state) => state.currentModel === target, 3200);
     if (selected.currentModel === target) return;
+    diagnostics.push(`第 ${attempt} 次已点击 ${option.debug}，工具栏仍为 ${selected.labels.join(" | ") || "未识别"}`);
   }
 
   const state = await inspectSelectedVideoModel(win);
+  const aspectState = await inspectSelectedDoubaoAspectRatio(win);
   throw new Error(
     `豆包模型未确认：要求 ${targetLabel}，当前为 ${state.currentModel ? doubaoVideoModelLabel(state.currentModel) : "未识别"}`
+      + `；页面 ${win.webContents.getURL()}`
+      + `；可见模型 ${state.labels.join(" | ") || "无"}`
+      + `；画幅控件 ${aspectState.summary || aspectState.labels.join(" | ") || "无"}`
+      + `；${diagnostics.join("；")}`
   );
 }
 
-async function inspectSelectedVideoModel(win: BrowserWindow) {
-  return runPageScript<{
-    currentModel: "mini" | "fast" | null;
-    labels: string[];
-  }>(win, `
+async function findExactDoubaoActionPoint(win: BrowserWindow, label: string, allowPrefix = false) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
-      const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const label = ${JSON.stringify(label)};
+      const allowPrefix = ${JSON.stringify(allowPrefix)};
+      const compact = (value) => String(value || "").replace(/[^\\p{L}\\p{N}]+/gu, "").trim();
+      const targetText = compact(label);
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
-        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none" && Number(style.opacity || "1") > 0.05;
       };
-      const textOf = (el) => [
+      const textOf = (el) => ([
         el.innerText,
-        el.textContent,
         el.getAttribute("aria-label"),
-        el.getAttribute("title")
-      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [aria-selected], [aria-checked], [aria-pressed], [aria-haspopup], [data-state]'))
+        el.getAttribute("title"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const candidates = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
-        .map((el) => ({
-          el,
-          text: textOf(el),
-          model: modelFromText(textOf(el)),
-          selected: el.getAttribute("aria-selected") === "true"
-            || el.getAttribute("aria-checked") === "true"
-            || el.getAttribute("aria-pressed") === "true"
-            || /checked|selected|active|on/i.test(el.getAttribute("data-state") || "")
-            || /selected|active|checked/.test(String(el.className || "").toLowerCase())
-        }))
-        .filter((item) => item.model);
-      const selected = nodes
-        .filter((item) => item.selected)
-        .sort((a, b) => a.text.length - b.text.length)[0];
-      const trigger = nodes
-        .filter((item) => item.el.tagName === "BUTTON"
-          || item.el.getAttribute("role") === "button"
-          || item.el.hasAttribute("aria-haspopup"))
-        .filter((item) => !item.el.closest('[role="option"], [role="menuitem"], [role="listbox"]'))
-        .sort((a, b) => a.text.length - b.text.length)[0];
-      const pageModels = (document.body?.innerText || "")
-        .split(/\\n+/)
-        .map((line) => modelFromText(line.trim()))
-        .filter(Boolean);
-      const fallback = pageModels.length === 1 ? pageModels[0] : null;
+        .filter((el) => !el.closest('[role="dialog"], [role="menu"], [role="listbox"]'))
+        .map((el) => {
+          const text = textOf(el);
+          const normalized = compact(text);
+          const clickable = el.closest('button, [role="button"], a, [tabindex], [aria-label], [title]') || el;
+          const rect = clickable.getBoundingClientRect();
+          const exact = normalized === targetText;
+          const prefix = allowPrefix && normalized.startsWith(targetText)
+            && normalized.length <= targetText.length + 24;
+          const selected = clickable.getAttribute("aria-selected") === "true"
+            || clickable.getAttribute("aria-pressed") === "true"
+            || /selected|active|checked/.test(String(clickable.className || "").toLowerCase());
+          return { clickable, text, rect, exact, prefix, selected };
+        })
+        .filter((item) => item.exact || item.prefix)
+        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+        .sort((a, b) => Number(b.exact) - Number(a.exact)
+          || Number(b.selected) - Number(a.selected)
+          || b.rect.bottom - a.rect.bottom
+          || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const target = candidates[0];
+      return target ? {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      } : null;
+    })()
+  `);
+}
+
+type DoubaoVideoModelState = {
+  currentModel: "mini" | "fast" | null;
+  labels: string[];
+};
+
+async function inspectSelectedVideoModel(win: BrowserWindow) {
+  return runPageScript<DoubaoVideoModelState>(win, `
+    (() => {
+      const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const isModelTriggerText = ${isDoubaoVideoModelTriggerText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05;
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editors[0] || null;
+      const editorRect = editor?.getBoundingClientRect() || null;
+      const nodes = Array.from(document.querySelectorAll('body *'))
+        .filter(visible)
+        .map((el) => {
+          const text = textOf(el);
+          const rect = el.getBoundingClientRect();
+          return {
+            text,
+            model: modelFromText(text),
+            rect,
+            toolbarLabel: isModelTriggerText(text),
+            nearEditor: Boolean(editorRect
+              && rect.bottom >= editorRect.top - 320
+              && rect.top <= editorRect.bottom + 40
+              && rect.bottom > window.innerHeight * 0.45)
+          };
+        })
+        .filter((item) => item.model && item.toolbarLabel && item.nearEditor)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const trigger = nodes[0];
       return {
-        currentModel: selected?.model || trigger?.model || fallback || null,
+        currentModel: trigger?.model || null,
         labels: nodes.map((item) => item.text).slice(0, 12)
       };
     })()
@@ -886,32 +1071,50 @@ async function clickDoubaoModelTrigger(win: BrowserWindow) {
   return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
     (() => {
       const modelFromText = ${doubaoVideoModelFromText.toString()};
+      const isModelTriggerText = ${isDoubaoVideoModelTriggerText.toString()};
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
-        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none" && Number(style.opacity || "1") > 0.05;
       };
-      const textOf = (el) => [
+      const textOf = (el) => ([
         el.innerText,
-        el.textContent,
         el.getAttribute("aria-label"),
-        el.getAttribute("title")
-      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-haspopup], [tabindex]'))
+        el.getAttribute("title"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editors[0] || null;
+      const editorRect = editor?.getBoundingClientRect() || null;
+      const candidates = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
         .map((el) => {
-          const rect = el.getBoundingClientRect();
+          const text = textOf(el);
+          const clickable = el.closest('button, [role="button"], [aria-haspopup], [tabindex]') || el;
+          const rect = clickable.getBoundingClientRect();
           return {
-            el,
-            text: textOf(el),
-            model: modelFromText(textOf(el)),
+            clickable,
+            text,
+            model: modelFromText(text),
             rect,
-            optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]'))
+            optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]')),
+            toolbarLabel: isModelTriggerText(text),
+            nearEditor: Boolean(editorRect
+              && rect.bottom >= editorRect.top - 320
+              && rect.top <= editorRect.bottom + 40
+              && rect.bottom > window.innerHeight * 0.45)
           };
         })
-        .filter((item) => item.model)
+        .filter((item) => item.nearEditor && item.toolbarLabel && item.model)
         .filter((item) => !item.optionLike)
-        .sort((a, b) => a.text.length - b.text.length);
+        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
       const target = candidates[0];
       if (!target) return null;
       return {
@@ -931,30 +1134,51 @@ async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
-        return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none";
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none" && Number(style.opacity || "1") > 0.05;
       };
-      const textOf = (el) => [
+      const textOf = (el) => ([
         el.innerText,
-        el.textContent,
         el.getAttribute("aria-label"),
-        el.getAttribute("title")
-      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [tabindex], [aria-label]'))
+        el.getAttribute("title"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\\s+/g, "");
+      const insideModelMenu = (el) => {
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 12; depth += 1, parent = parent.parentElement) {
+          if (!visible(parent)) continue;
+          const rect = parent.getBoundingClientRect();
+          const text = compactText(parent);
+          if (rect.width <= 800 && rect.height <= 800
+            && text.includes("Seedance2.0Mini")
+            && text.includes("Seedance2.0Fast")) {
+            return true;
+          }
+        }
+        return false;
+      };
+      const candidates = Array.from(document.querySelectorAll('body *'))
         .filter(visible)
         .map((el) => {
-          const rect = el.getBoundingClientRect();
+          const text = textOf(el);
+          const clickable = el.closest('button, [role="button"], [role="option"], [role="menuitem"], [tabindex]') || el;
+          const rect = clickable.getBoundingClientRect();
           return {
-            el,
-            text: textOf(el),
-            model: modelFromText(textOf(el)),
+            clickable,
+            text,
+            model: modelFromText(text),
             rect,
-            optionLike: Boolean(el.closest('[role="option"], [role="menuitem"], [role="listbox"]')),
-            hasPopup: el.hasAttribute("aria-haspopup")
+            insideModelMenu: insideModelMenu(el)
           };
         })
         .filter((item) => item.model === target)
-        .filter((item) => item.optionLike || !item.hasPopup)
-        .sort((a, b) => Number(b.optionLike) - Number(a.optionLike) || a.text.length - b.text.length);
+        .filter((item) => item.insideModelMenu)
+        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+        .sort((a, b) => a.rect.width * a.rect.height - b.rect.width * b.rect.height || b.rect.bottom - a.rect.bottom);
       const option = candidates[0];
       if (!option) return null;
       return {
@@ -966,7 +1190,360 @@ async function clickExactDoubaoModelOption(win: BrowserWindow, model: "mini" | "
   `);
 }
 
-async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, prompt: string) {
+async function waitForDoubaoVideoModelState(
+  win: BrowserWindow,
+  predicate: (state: DoubaoVideoModelState) => boolean,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  let latest: DoubaoVideoModelState = { currentModel: null, labels: [] };
+  while (Date.now() < deadline) {
+    try {
+      latest = await inspectSelectedVideoModel(win);
+      if (predicate(latest)) return latest;
+    } catch {
+      // The composer can be replaced briefly while switching creation modes.
+    }
+    await wait(250);
+  }
+  return latest;
+}
+
+async function waitForDoubaoVideoModelOption(
+  win: BrowserWindow,
+  model: "mini" | "fast",
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const option = await clickExactDoubaoModelOption(win, model);
+      if (option) return option;
+    } catch {
+      // Retry while the model popover mounts.
+    }
+    await wait(200);
+  }
+  return null;
+}
+
+type DoubaoAspectRatioState = {
+  currentAspectRatio: DoubaoAspectRatio | null;
+  summary: string | null;
+  labels: string[];
+};
+
+async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
+  return runPageScript<DoubaoAspectRatioState>(win, `
+    (() => {
+      const ratioFromText = ${doubaoAspectRatioFromText.toString()};
+      const isTriggerText = ${isDoubaoAspectRatioTriggerText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editors[0] || null;
+      let composerRoot = editor;
+      for (let parent = editor?.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth += 1) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 520) break;
+        if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
+      }
+      const sourceNodes = composerRoot
+        ? [composerRoot, ...Array.from(composerRoot.querySelectorAll('*'))]
+        : Array.from(document.querySelectorAll('body *'));
+      const items = sourceNodes
+        .filter(visible)
+        .map((el) => {
+          const interactive = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]');
+          const clickable = interactive || (getComputedStyle(el).cursor === "pointer" ? el : null);
+          const rect = (clickable || el).getBoundingClientRect();
+          const text = textOf(el);
+          return {
+            el,
+            text,
+            ratio: ratioFromText(text),
+            summary: Boolean(clickable) && isTriggerText(text)
+              && (!composerRoot || composerRoot.contains(clickable)),
+            rect
+          };
+        })
+        .filter((item) => item.ratio);
+      const trigger = items
+        .filter((item) => item.summary)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.text.length - b.text.length)[0];
+      return {
+        // Only the collapsed toolbar summary is authoritative. A highlighted
+        // option in an open popover does not prove that Doubao applied it.
+        currentAspectRatio: trigger?.ratio || null,
+        summary: trigger?.text || null,
+        labels: items.map((item) => item.text).slice(0, 12)
+      };
+    })()
+  `);
+}
+
+async function clickDoubaoAspectRatioTrigger(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const isTriggerText = ${isDoubaoAspectRatioTriggerText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editors[0] || null;
+      let composerRoot = editor;
+      for (let parent = editor?.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth += 1) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 520) break;
+        if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
+      }
+      const sourceNodes = composerRoot
+        ? [composerRoot, ...Array.from(composerRoot.querySelectorAll('*'))]
+        : Array.from(document.querySelectorAll('body *'));
+      const candidates = sourceNodes
+        .filter(visible)
+        .map((el) => {
+          const text = textOf(el);
+          const clickable = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]')
+            || (getComputedStyle(el).cursor === "pointer" ? el : null);
+          if (!clickable) return null;
+          const rect = clickable.getBoundingClientRect();
+          return {
+            text,
+            clickable,
+            inToolbarRegion: !composerRoot || composerRoot.contains(clickable),
+            rect
+          };
+        })
+        .filter(Boolean)
+        .filter((item) => item.inToolbarRegion && isTriggerText(item.text))
+        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
+    })()
+  `);
+}
+
+async function clickExactDoubaoAspectRatioOption(win: BrowserWindow, targetRatio: DoubaoAspectRatio) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const targetRatio = ${JSON.stringify(targetRatio)};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\s+/g, "");
+      const insideRatioMenu = (el) => {
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 9; depth += 1, parent = parent.parentElement) {
+          if (!visible(parent)) continue;
+          const rect = parent.getBoundingClientRect();
+          const text = compactText(parent);
+          if (rect.width <= 720
+            && rect.height <= 720
+            && text.includes("比例")
+            && text.includes("自动")
+            && text.includes("9:16")
+            && text.includes("16:9")) {
+            return true;
+          }
+        }
+        return false;
+      };
+      const candidates = Array.from(document.querySelectorAll('body *'))
+        .filter(visible)
+        .map((el) => {
+          const text = textOf(el);
+          const clickable = el.closest('button, [role="button"], [role="option"], [role="menuitem"], [tabindex]') || el;
+          const rect = clickable.getBoundingClientRect();
+          return {
+            text,
+            exact: text.replace(/\s+/g, "") === targetRatio,
+            insideRatioMenu: insideRatioMenu(el),
+            clickable,
+            rect
+          };
+        })
+        .filter((item) => item.exact && item.insideRatioMenu)
+        .filter((item, index, items) => items.findIndex((candidate) => candidate.clickable === item.clickable) === index)
+        .sort((a, b) => a.rect.width * a.rect.height - b.rect.width * b.rect.height || b.rect.bottom - a.rect.bottom);
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
+    })()
+  `);
+}
+
+async function waitForDoubaoAspectRatioState(
+  win: BrowserWindow,
+  predicate: (state: DoubaoAspectRatioState) => boolean,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  let latest: DoubaoAspectRatioState = { currentAspectRatio: null, summary: null, labels: [] };
+  while (Date.now() < deadline) {
+    try {
+      latest = await inspectSelectedDoubaoAspectRatio(win);
+      if (predicate(latest)) return latest;
+    } catch {
+      // The page can briefly replace the composer while video mode initializes.
+    }
+    await wait(250);
+  }
+  return latest;
+}
+
+async function waitForDoubaoAspectRatioOption(
+  win: BrowserWindow,
+  targetRatio: DoubaoAspectRatio,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const option = await clickExactDoubaoAspectRatioOption(win, targetRatio);
+      if (option) return option;
+    } catch {
+      // Retry while the popover mounts or the page replaces a transient node.
+    }
+    await wait(200);
+  }
+  return null;
+}
+
+async function selectDoubaoAspectRatio(win: BrowserWindow, targetRatio: DoubaoAspectRatio) {
+  const initial = await waitForDoubaoAspectRatioState(win, (state) => Boolean(state.summary), 2500);
+  if (initial.currentAspectRatio === targetRatio) {
+    return { before: initial.currentAspectRatio, after: initial.currentAspectRatio, attempts: 0 };
+  }
+
+  const diagnostics: string[] = [];
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await sendKeyboard(win, "Escape", undefined, 180);
+    const before = await waitForDoubaoAspectRatioState(win, (state) => Boolean(state.summary), 1800);
+    if (before.currentAspectRatio === targetRatio) {
+      return { before: initial.currentAspectRatio, after: before.currentAspectRatio, attempts: attempt - 1 };
+    }
+
+    let trigger: Awaited<ReturnType<typeof clickDoubaoAspectRatioTrigger>> = null;
+    try {
+      trigger = await clickDoubaoAspectRatioTrigger(win);
+    } catch {
+      // Retry from a clean menu state below.
+    }
+    if (!trigger) {
+      diagnostics.push(`第 ${attempt} 次未找到工具栏画幅入口（当前 ${before.summary || "未识别"}）`);
+      continue;
+    }
+
+    await sendMouseClick(win, trigger.x, trigger.y);
+    const option = await waitForDoubaoAspectRatioOption(win, targetRatio, 2600);
+    if (!option) {
+      diagnostics.push(`第 ${attempt} 次已点击入口 ${trigger.debug}，但比例弹窗内未找到 ${targetRatio}`);
+      continue;
+    }
+
+    await sendMouseClick(win, option.x, option.y);
+    const selected = await waitForDoubaoAspectRatioState(
+      win,
+      (state) => state.currentAspectRatio === targetRatio,
+      3200
+    );
+    if (selected.currentAspectRatio === targetRatio) {
+      await sendKeyboard(win, "Escape", undefined, 150);
+      return { before: initial.currentAspectRatio, after: selected.currentAspectRatio, attempts: attempt };
+    }
+    diagnostics.push(
+      `第 ${attempt} 次入口 ${trigger.debug}，已点击选项 ${option.debug}，点击后 ${selected.summary || selected.currentAspectRatio || "未识别"}`
+    );
+  }
+
+  const state = await waitForDoubaoAspectRatioState(win, () => false, 600);
+  throw new Error(
+    `豆包画幅未确认：要求 ${targetRatio}，当前为 ${state.currentAspectRatio || "未识别"}`
+      + `；页面 ${win.webContents.getURL()}`
+      + `；可见画幅 ${state.labels.join(" | ") || "无"}`
+      + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
+  );
+}
+
+async function submitPromptAndWait(
+  win: BrowserWindow,
+  model: DoubaoModel,
+  prompt: string,
+  onProgress: (message: string) => Promise<void> | void = () => undefined,
+  suggestionFollowUpCount = 0
+): Promise<"confirmed"> {
   const baselineText = await getRawPageText(win);
   const attempts: Array<{ label: string; run: () => Promise<boolean> }> = [
     {
@@ -1010,17 +1587,51 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
     const didRun = await attempt.run();
     if (!didRun) continue;
     tried.push(attempt.label);
-    const result = await waitForSubmissionStarted(win, model, baselineText, prompt, 8000);
+    const result = await waitForSubmissionStarted(win, model, baselineText, prompt, 12000);
+    if (result.safetyConfirmationClicked) {
+      await onProgress("检测到豆包素材安全确认，已点击确认");
+    }
     if (result.failureMessage) {
       throw new DoubaoPageFailureError(
         `豆包提交后返回失败：${result.failureMessage}`,
         isQuotaNotChargedFailure(result.failureMessage)
       );
     }
-    if (result.confirmed) return;
+    if (result.confirmationClicked) {
+      await onProgress(`已点击豆包“${result.confirmationLabel || "确认生成"}”，等待视频任务启动`);
+    }
+    if (result.confirmed || result.pending) return "confirmed";
     if (result.responseMessage) {
       if (isDoubaoCongestionReply(result.responseMessage)) {
         throw new DoubaoCongestionError(result.responseMessage);
+      }
+      if (isDoubaoGenerationPending(result.responseMessage)) {
+        await onProgress("豆包已确认视频任务，当前正在生成或渲染，继续等待结果");
+        return "confirmed";
+      }
+      if (isDoubaoPromptSuggestion(result.responseMessage)) {
+        if (suggestionFollowUpCount >= 3) {
+          throw new DoubaoPageFailureError(
+            `豆包连续返回提示词建议，已尝试明确生成指令但仍未确认视频生成：${result.responseMessage}`,
+            true
+          );
+        }
+        // Doubao now commonly presents a short action reply with a visible
+        // “确认生成” action. Use that exact action first; only fall back to
+        // the longer direct-generation wording when the first response does
+        // not start the video task.
+        const followUp = suggestionFollowUpCount === 0
+          ? DIRECT_GENERATION_CONFIRM_FOLLOW_UP
+          : suggestionFollowUpCount === 1
+            ? DIRECT_GENERATION_FOLLOW_UP
+            : DIRECT_GENERATION_SHORT_FOLLOW_UP;
+        await onProgress(suggestionFollowUpCount === 0
+          ? `豆包先返回了提示词建议，优先回复“${followUp}”并继续提交`
+          : suggestionFollowUpCount === 1
+            ? `豆包未按“确认生成”启动任务，正在回复“${followUp}”并继续提交`
+            : `豆包仍未执行视频生成，正在发送备用指令“${followUp}”`);
+        await fillPrompt(win, followUp);
+        return submitPromptAndWait(win, model, followUp, onProgress, suggestionFollowUpCount + 1);
       }
       throw new DoubaoPageFailureError(
         `豆包没有确认视频生成；页面最新回复：${result.responseMessage}`,
@@ -1029,7 +1640,7 @@ async function submitPromptAndWait(win: BrowserWindow, model: DoubaoModel, promp
     }
     if (result.sentEvidence) {
       throw new DoubaoPageFailureError(
-        "提示词已发送，但豆包没有返回视频生成确认，也没有识别到新的回复文字",
+        "豆包已收到消息，但没有确认已启动视频生成；为避免误判成功和重复提交，本次已停止等待",
         true
       );
     }
@@ -1169,12 +1780,141 @@ async function findComposerSendButtonPoint(win: BrowserWindow) {
   `);
 }
 
+async function findDoubaoGenerationActionPoint(win: BrowserWindow, baselineText: string) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const baselineText = ${JSON.stringify(baselineText)};
+      const isDoubaoGenerationActionText = ${isDoubaoGenerationActionText.toString()};
+      const pageText = document.body?.innerText || "";
+      if (baselineText && pageText === baselineText) return null;
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 20
+          && rect.height > 10
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none"
+          && !el.disabled
+          && el.getAttribute("aria-disabled") !== "true";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const candidates = Array.from(document.querySelectorAll(
+        'button, [role="button"], a, [tabindex], [aria-label], [title], [class*="button"], [class*="Button"], [class*="btn"], div, span'
+      ))
+        .filter(visible)
+        .map((el, index) => {
+          const rect = el.getBoundingClientRect();
+          const text = textOf(el);
+          const style = getComputedStyle(el);
+          const className = typeof el.className === "string" ? el.className : "";
+          const interactive = el.matches('button, [role="button"], a, [tabindex], [aria-label], [title], [onclick]')
+            || style.cursor === "pointer"
+            || /button|btn|confirm|action/i.test(className);
+          return { el, index, rect, text, interactive, area: rect.width * rect.height };
+        })
+        .filter((item) => item.interactive && isDoubaoGenerationActionText(item.text))
+        .sort((a, b) => Number(b.interactive) - Number(a.interactive)
+          || a.area - b.area
+          || b.rect.bottom - a.rect.bottom
+          || b.index - a.index);
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
+    })()
+  `);
+}
+
+async function findDoubaoSafetyConfirmationPoint(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const isDoubaoSafetyConfirmationDialog = ${isDoubaoSafetyConfirmationDialog.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 20
+          && rect.height > 20
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none";
+      };
+      const textOf = (el) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
+      const hasExactText = (el, expected) => [
+        el.innerText,
+        el.textContent,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].filter(Boolean).some((value) => String(value).replace(/[^\\p{L}\\p{N}]+/gu, "") === expected);
+      const safetyHeadingNodes = Array.from(document.querySelectorAll('body *'))
+        .filter(visible)
+        .filter((el) => /安全确认/.test(textOf(el)));
+      const contexts = [];
+      for (const heading of safetyHeadingNodes) {
+        let context = heading;
+        for (let level = 0; context && level < 12; level += 1, context = context.parentElement) {
+          const text = textOf(context);
+          if (isDoubaoSafetyConfirmationDialog(text)) {
+            contexts.push({ el: context, text });
+          }
+        }
+      }
+      const dialogs = contexts
+        .filter((item, index, all) => all.findIndex((other) => other.el === item.el) === index)
+        .sort((a, b) => a.text.length - b.text.length);
+      const dialog = dialogs[0];
+      if (!dialog) return null;
+      // Doubao may render these actions as div/span pseudo-buttons without a
+      // role or tabindex. The exact text and the bounded safety context keep
+      // this from clicking unrelated page-level “确认” actions.
+      const buttons = Array.from(dialog.el.querySelectorAll('button, [role="button"], [tabindex], [aria-label], [title], a, label, div, span'))
+        .filter(visible)
+        .map((el) => ({ el, text: textOf(el), rect: el.getBoundingClientRect() }))
+        .filter((item) => !item.el.disabled
+          && item.el.getAttribute("aria-disabled") !== "true"
+          && hasExactText(item.el, "确认"))
+        .sort((a, b) => {
+          const aRole = a.el.matches('button, [role="button"], [tabindex], a, label') ? 1 : 0;
+          const bRole = b.el.matches('button, [role="button"], [tabindex], a, label') ? 1 : 0;
+          return bRole - aRole
+            || a.rect.width * a.rect.height - b.rect.width * b.rect.height
+            || a.rect.top - b.rect.top;
+        });
+      const target = buttons[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
+    })()
+  `);
+}
+
 async function sendMouseClick(win: BrowserWindow, x: number, y: number) {
-  win.webContents.sendInputEvent({ type: "mouseMove", x, y });
+  await sendMouseMove(win, x, y);
   await wait(80);
   win.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
   await wait(80);
   win.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+}
+
+async function sendMouseMove(win: BrowserWindow, x: number, y: number) {
+  win.webContents.sendInputEvent({ type: "mouseMove", x, y });
+  await wait(80);
 }
 
 async function waitForSubmissionStarted(
@@ -1188,9 +1928,39 @@ async function waitForSubmissionStarted(
   const startedAt = Date.now();
   let sentEvidenceSeen = false;
   let latestResponseMessage: string | null = null;
+  let confirmationClicked = false;
+  let confirmationLabel: string | null = null;
+  let safetyConfirmationClicked = false;
   while (Date.now() - startedAt < timeoutMs) {
+    if (!safetyConfirmationClicked) {
+      try {
+        const safetyPoint = await findDoubaoSafetyConfirmationPoint(win);
+        if (safetyPoint) {
+          await sendMouseClick(win, safetyPoint.x, safetyPoint.y);
+          safetyConfirmationClicked = true;
+          await wait(900);
+        }
+      } catch (error) {
+        console.warn("豆包素材安全确认暂时无法检查", error);
+      }
+    }
+    if (!confirmationClicked) {
+      try {
+        const actionPoint = await findDoubaoGenerationActionPoint(win, baselineText);
+        if (actionPoint) {
+          await sendMouseClick(win, actionPoint.x, actionPoint.y);
+          confirmationClicked = true;
+          confirmationLabel = actionPoint.debug;
+          await wait(900);
+        }
+      } catch (error) {
+        console.warn("豆包确认生成按钮暂时无法检查", error);
+      }
+    }
+
     const state = await runPageScript<{
       confirmed: boolean;
+      pending: boolean;
       sentEvidence: boolean;
       failureMessage: string | null;
       responseMessage: string | null;
@@ -1203,14 +1973,33 @@ async function waitForSubmissionStarted(
         const extractDoubaoFailureMessage = ${extractDoubaoFailureMessage.toString()};
         const extractNewDoubaoReply = ${extractNewDoubaoReply.toString()};
         const hasNewDoubaoSubmissionConfirmation = ${hasNewDoubaoSubmissionConfirmation.toString()};
+        const isDoubaoSafetyConfirmationDialog = ${isDoubaoSafetyConfirmationDialog.toString()};
         const hasNewPromptOccurrence = ${hasNewPromptOccurrence.toString()};
         const hasNewTextOccurrence = ${hasNewTextOccurrence.toString()};
+        const hasStrongSubmissionEvidence = ${hasStrongSubmissionEvidence.toString()};
+        const isFormalDoubaoConversationUrl = ${isFormalDoubaoConversationUrl.toString()};
+        const safetyConfirmationClicked = ${JSON.stringify(safetyConfirmationClicked)};
         const pageText = (document.body?.innerText || "").trim();
         const failureMessage = extractDoubaoFailureMessage(pageText);
         const newFailureMessage = failureMessage && hasNewTextOccurrence(pageText, baselineText, failureMessage)
           ? failureMessage
           : null;
-        const responseMessage = extractNewDoubaoReply(pageText, baselineText, prompt);
+        const rawResponseMessage = extractNewDoubaoReply(pageText, baselineText, prompt);
+        const responseMessage = rawResponseMessage
+          && !(safetyConfirmationClicked
+            && (isDoubaoSafetyConfirmationDialog(rawResponseMessage)
+              || rawResponseMessage.includes("安全确认")))
+          ? rawResponseMessage
+          : null;
+        const normalizedResponseMessage = (rawResponseMessage || "").replace(/\\s+/g, " ").replace(/\\*+/g, "").trim();
+        const pendingResponse = Boolean(
+          normalizedResponseMessage
+          && !extractDoubaoFailureMessage(normalizedResponseMessage)
+          && !/你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(normalizedResponseMessage)
+          && (/正在为您生成一段|视频生成中|视频生成已提交|已提交视频生成任务|已提交生成任务|生成任务已提交|正在渲染|等待(?:视频)?(?:生成|渲染)(?:完成|结果)/.test(normalizedResponseMessage)
+            || (/本次使用\\s+Seedance\\s+2\\.0\\s+(?:Mini|Fast)\\s+生成/.test(normalizedResponseMessage)
+              && /预计等待\\s*\\d+\\s*分钟|视频生成好后|本次生成将消耗每日免费额度/.test(normalizedResponseMessage)))
+        );
         const visible = (el) => {
           const rect = el.getBoundingClientRect();
           const style = getComputedStyle(el);
@@ -1230,11 +2019,20 @@ async function waitForSubmissionStarted(
         const promptStillInComposer = Boolean(promptSignature && normalizedEditorText.includes(promptSignature));
         const composerCleared = !editor || normalizedEditorText.length === 0 || !promptStillInComposer;
         const pageChanged = pageText !== baselineText;
-        const sentEvidence = !newFailureMessage
-          && pageChanged
-          && (hasNewPromptOccurrence(pageText, baselineText, prompt) || composerCleared);
+        const confirmationTextAdded = hasNewDoubaoSubmissionConfirmation(pageText, baselineText, modelLabel);
+        const promptMessageAdded = hasNewPromptOccurrence(pageText, baselineText, prompt);
+        const sentEvidence = !newFailureMessage && hasStrongSubmissionEvidence({
+          confirmationTextAdded,
+          promptMessageAdded,
+          formalConversationUrl: isFormalDoubaoConversationUrl(location.href),
+          composerCleared,
+          pageChanged
+        });
         return {
-          confirmed: hasNewDoubaoSubmissionConfirmation(pageText, baselineText, modelLabel),
+          confirmed: confirmationTextAdded,
+          // Keep a direct fallback when reply extraction contains the accepted
+          // status sentence but baseline counting is ambiguous.
+          pending: pendingResponse,
           sentEvidence,
           failureMessage: newFailureMessage,
           responseMessage,
@@ -1244,21 +2042,45 @@ async function waitForSubmissionStarted(
     `);
 
     if (state.failureMessage) {
-      return { confirmed: false, sentEvidence: false, failureMessage: state.failureMessage, responseMessage: null };
+      return {
+        confirmed: false,
+        pending: false,
+        sentEvidence: false,
+        failureMessage: state.failureMessage,
+        responseMessage: null,
+        confirmationClicked,
+        confirmationLabel,
+        safetyConfirmationClicked
+      };
     }
-    if (state.confirmed) {
-      return { confirmed: true, sentEvidence: true, failureMessage: null, responseMessage: null };
+    if (state.confirmed || state.pending) {
+      return {
+        confirmed: state.confirmed,
+        pending: state.pending,
+        sentEvidence: true,
+        failureMessage: null,
+        responseMessage: null,
+        confirmationClicked,
+        confirmationLabel,
+        safetyConfirmationClicked
+      };
     }
     sentEvidenceSeen ||= state.sentEvidence;
-    latestResponseMessage = state.responseMessage || latestResponseMessage;
+    if (!confirmationClicked) {
+      latestResponseMessage = state.responseMessage || latestResponseMessage;
+    }
     await wait(1000);
   }
 
   return {
     confirmed: false,
+    pending: false,
     sentEvidence: sentEvidenceSeen,
     failureMessage: null,
-    responseMessage: latestResponseMessage
+    responseMessage: confirmationClicked ? null : latestResponseMessage,
+    confirmationClicked,
+    confirmationLabel,
+    safetyConfirmationClicked
   };
 }
 
@@ -1300,6 +2122,7 @@ async function waitForGenerationResult(
   let directVideoUrl: string | null = null;
   let shareFailureReason: string | null = null;
   let historyFallbackAttempted = false;
+  let generatedRecoveryAttempted = false;
 
   while (Date.now() - startedAt < timeoutMs) {
     const pageState = await inspectGenerationPage(win);
@@ -1351,6 +2174,27 @@ async function waitForGenerationResult(
         return { shareUrl: copied.shareUrl, directVideoUrl };
       }
 
+      if (!generatedRecoveryAttempted) {
+        generatedRecoveryAttempted = true;
+        await onProgress("当前分享页尚未同步视频，正在回到本次豆包会话自动恢复结果");
+        const originalUrl = win.webContents.getURL();
+        const recovery = await findGeneratedConversationAndCopyShare(
+          win,
+          prompt,
+          extractDoubaoConversationUrl(originalUrl) || preferredConversationUrl,
+          onProgress
+        );
+        if (recovery.shareUrl) {
+          return { shareUrl: recovery.shareUrl, directVideoUrl };
+        }
+        shareFailureReason = recovery.shareFailureReason || recovery.failureMessage || shareFailureReason;
+        if (originalUrl) {
+          await loadUrl(win, originalUrl);
+          await wait(1500);
+          await dismissDoubaoDesktopDownloadPrompt(win);
+        }
+      }
+
       if (Date.now() - generatedAt > 120000) {
         return { shareUrl: null, directVideoUrl, shareFailureReason };
       }
@@ -1364,7 +2208,8 @@ async function waitForGenerationResult(
       const recovery = await findGeneratedConversationAndCopyShare(
         win,
         prompt,
-        currentConversationUrl || preferredConversationUrl
+        currentConversationUrl || preferredConversationUrl,
+        onProgress
       );
       if (recovery.shareUrl) {
         return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1396,7 +2241,8 @@ async function waitForGenerationResult(
   const recovery = await findGeneratedConversationAndCopyShare(
     win,
     prompt,
-    extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl
+    extractDoubaoConversationUrl(win.webContents.getURL()) || preferredConversationUrl,
+    onProgress
   );
   if (recovery.shareUrl) {
     return { shareUrl: recovery.shareUrl, directVideoUrl };
@@ -1444,6 +2290,42 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
         ].filter(Boolean).join(" ");
         return /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(source);
       });
+      const generatedMedia = [];
+      const completionTextNodes = Array.from(document.querySelectorAll("*"))
+        .filter((el) => {
+          const ownText = Array.from(el.childNodes)
+            .filter((node) => node.nodeType === Node.TEXT_NODE)
+            .map((node) => node.textContent || "")
+            .join(" ")
+            .replace(/\\s+/g, " ")
+            .trim();
+          return /你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(ownText);
+        });
+      for (const node of completionTextNodes) {
+        let ancestor = node;
+        for (let level = 0; ancestor && level < 8; level += 1, ancestor = ancestor.parentElement) {
+          const media = Array.from(ancestor.querySelectorAll("video, img, canvas"))
+            .filter((el) => {
+              const rect = el.getBoundingClientRect();
+              const style = getComputedStyle(el);
+              return rect.width > 80
+                && rect.height > 60
+                && style.visibility !== "hidden"
+                && style.display !== "none";
+            })
+            .filter((el) => {
+              if (el.tagName !== "IMG") return true;
+              const source = [el.currentSrc, el.src, el.getAttribute("src"), el.getAttribute("data-src")]
+                .filter(Boolean).join(" ");
+              return !/^data:image\\/svg\\+xml/i.test(source);
+            });
+          if (media.length) {
+            generatedMedia.push(...media);
+            break;
+          }
+        }
+      }
+      const uniqueVideoCardImages = Array.from(new Set([...videoCardImages, ...generatedMedia]));
       const videoSourceLists = videos.map((video) => [
         video.currentSrc,
         video.src,
@@ -1471,7 +2353,7 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
         videoUrls,
         visibleVideoCount: videos.length,
         playableVideoCount,
-        videoCardCount: videos.length + videoCardImages.length
+        videoCardCount: videos.length + uniqueVideoCardImages.length
       };
     })()
   `);
@@ -1480,7 +2362,8 @@ async function inspectGenerationPage(win: BrowserWindow, scrollToLatest = true) 
 async function findGeneratedConversationAndCopyShare(
   win: BrowserWindow,
   prompt: string,
-  preferredConversationUrl: string | null = null
+  preferredConversationUrl: string | null = null,
+  onProgress: (message: string) => Promise<void> | void = () => undefined
 ) {
   const normalizedPrompt = normalizeComparableText(prompt);
   const candidates = await runPageScript<string[]>(win, `
@@ -1508,7 +2391,8 @@ async function findGeneratedConversationAndCopyShare(
           try {
             const url = new URL(href);
             return /^(?:www\\.)?doubao\\.com$/i.test(url.hostname)
-              && /^\\/chat\\/[A-Za-z0-9._~-]+/i.test(url.pathname);
+              && /^\\/chat\\/[A-Za-z0-9._~-]+/i.test(url.pathname)
+              && !/^\\/chat\\/local_/i.test(url.pathname);
           } catch {
             return false;
           }
@@ -1517,11 +2401,13 @@ async function findGeneratedConversationAndCopyShare(
       const unique = Array.from(new Map(links.map((item) => [item.href, item])).values());
       return unique
         .sort((a, b) => b.score - a.score || a.index - b.index)
+        .slice(0, ${RECENT_CONVERSATION_FALLBACK_LIMIT})
         .map((item) => item.href)
-        .slice(0, 30);
     })()
   `);
-  const preferredUrl = extractDoubaoConversationUrl(preferredConversationUrl);
+  const preferredUrl = isFormalDoubaoConversationUrl(preferredConversationUrl)
+    ? extractDoubaoConversationUrl(preferredConversationUrl)
+    : null;
   const orderedCandidates = Array.from(new Set([
     preferredUrl,
     ...candidates
@@ -1541,10 +2427,13 @@ async function findGeneratedConversationAndCopyShare(
   let failureMessage: string | null = null;
   let shareFailureReason: string | null = null;
 
-  for (const candidate of orderedCandidates) {
+  for (let candidateIndex = 0; candidateIndex < orderedCandidates.length; candidateIndex += 1) {
+    const candidate = orderedCandidates[candidateIndex];
+    const isPreferred = Boolean(preferredUrl && candidate === preferredUrl);
+    await onProgress(isPreferred
+      ? "正在检查已记录的本次豆包对话"
+      : `正在检查最近对话 ${candidateIndex - (preferredUrl ? 0 : -1)}/${candidates.length}`);
     try {
-      // A stale conversation link must not block recovery indefinitely. The
-      // newest conversation is normally near the front of this list.
       await loadUrl(win, candidate, 8000);
     } catch (error) {
       console.warn("跳过无法加载的豆包历史对话", candidate, error);
@@ -1555,7 +2444,8 @@ async function findGeneratedConversationAndCopyShare(
 
     let pageText = "";
     let matchedPrompt = false;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    const promptMatchAttempts = isPreferred ? 10 : 4;
+    for (let attempt = 0; attempt < promptMatchAttempts; attempt += 1) {
       pageText = await runPageScript<string>(win, `document.body?.innerText || ""`);
       const normalizedPageText = normalizeComparableText(pageText);
       const signatureMatches = signatures.filter((signature) => normalizedPageText.includes(signature)).length;
@@ -1564,10 +2454,18 @@ async function findGeneratedConversationAndCopyShare(
       if (matchedPrompt) break;
       await wait(350);
     }
-    if (!matchedPrompt) continue;
-    promptMatchCount += 1;
+    if (matchedPrompt) promptMatchCount += 1;
+    if (!isPreferred && !matchedPrompt) continue;
+    await onProgress(isPreferred
+      ? matchedPrompt
+        ? "已锁定本次正式会话并匹配提示词，正在确认视频结果"
+        : "已锁定本次正式会话，页面未完整渲染原提示词，直接按会话确认视频结果"
+      : "已匹配本次提示词，正在确认视频结果");
 
-    const pageState = await waitForGeneratedVideoCard(win, VIDEO_CARD_WAIT_MS);
+    const pageState = await waitForGeneratedVideoCard(
+      win,
+      isPreferred ? PREFERRED_CONVERSATION_RETRY_MS : VIDEO_CARD_WAIT_MS
+    );
     if (pageState.failureMessage) {
       failureMessage ||= pageState.failureMessage;
       continue;
@@ -1577,12 +2475,20 @@ async function findGeneratedConversationAndCopyShare(
       continue;
     }
     if (pageState.videoCardCount <= 0) {
+      await onProgress("已识别完成文案，等待新版视频卡片渲染");
       shareFailureReason = "匹配对话已完成，但视频卡片仍未渲染";
       continue;
     }
     generatedMatchCount += 1;
+    await onProgress("已检测到新版视频卡片，正在复制当前视频分享链接");
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const shareStartedAt = Date.now();
+    let shareAttempt = 0;
+    do {
+      shareAttempt += 1;
+      await onProgress(isPreferred
+        ? `已锁定本次对话，等待分享资源同步（第 ${shareAttempt} 次）`
+        : `最近对话 ${candidateIndex - (preferredUrl ? 0 : -1)} 已匹配，正在复制分享链接`);
       const copied = await tryCopyShareLink(win);
       shareFailureReason = copied.reason;
       if (copied.shareUrl) {
@@ -1596,7 +2502,14 @@ async function findGeneratedConversationAndCopyShare(
           shareFailureReason: null
         };
       }
-      await wait(1000);
+      const shouldRetryPreferred = isPreferred
+        && Date.now() - shareStartedAt < PREFERRED_CONVERSATION_RETRY_MS;
+      if (!shouldRetryPreferred || win.isDestroyed()) break;
+      await wait(5000);
+    } while (Date.now() - shareStartedAt < PREFERRED_CONVERSATION_RETRY_MS);
+
+    if (isPreferred && candidates.some((item) => item !== preferredUrl)) {
+      await onProgress(`已记录对话暂未同步有效分享资源，改为检查同账号最近 ${Math.min(candidates.length, RECENT_CONVERSATION_FALLBACK_LIMIT)} 条对话`);
     }
   }
 
@@ -1623,113 +2536,120 @@ async function waitForGeneratedVideoCard(win: BrowserWindow, timeoutMs: number) 
 }
 
 async function tryCopyShareLink(win: BrowserWindow) {
-  return clipboardMutex.runExclusive(async () => {
-    if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
+  if (win.isDestroyed()) return { shareUrl: null, reason: "执行窗口已关闭" } satisfies ShareCopyResult;
 
-    const before = clipboard.readText();
-    const clipboardSentinel = `__doubao_share_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
-    clipboard.writeText(clipboardSentinel);
-    let result: ShareCopyResult = { shareUrl: null, reason: "未找到分享面板" };
+  let result: ShareCopyResult = { shareUrl: null, reason: "未找到分享面板" };
+  try {
+    await dismissDoubaoDesktopDownloadPrompt(win);
 
-    try {
-      await dismissDoubaoDesktopDownloadPrompt(win);
+    const generationState = await inspectGenerationPage(win, false);
+    if (generationState.failureMessage) {
+      return {
+        shareUrl: null,
+        reason: `当前任务未产生视频：${generationState.failureMessage}`
+      };
+    }
+    if (!generationState.generated) {
+      return { shareUrl: null, reason: "当前对话尚未确认视频生成完成" };
+    }
 
-      const generationState = await inspectGenerationPage(win, false);
-      if (generationState.failureMessage) {
-        result = {
-          shareUrl: null,
-          reason: `当前任务未产生视频：${generationState.failureMessage}`
-        };
-        return result;
-      }
-      if (!generationState.generated) {
-        result = { shareUrl: null, reason: "当前对话尚未确认视频生成完成" };
-        return result;
-      }
+    await primeGeneratedVideoCard(win);
 
-      await primeGeneratedVideoCard(win);
+    // Doubao's “复制链接” button writes a ClipboardItem to navigator.clipboard.
+    // Capture that write inside the page so the user's OS clipboard is untouched.
+    const captureInstalled = await installDoubaoPageClipboardCapture(win);
+    if (!captureInstalled) {
+      return { shareUrl: null, reason: "无法安装页面分享链接捕获器，未触碰系统剪贴板" };
+    }
 
-      const acceptCopiedShareUrl = async (shareUrl: string) => {
-        try {
-          await verifyDoubaoShareVideoResource(shareUrl);
+    const acceptCapturedShareUrl = async (shareUrl: string) => {
+      try {
+        await verifyDoubaoShareVideoResource(shareUrl);
+        result = { shareUrl, reason: null };
+        return true;
+      } catch (error) {
+        // New Doubao share pages are often a client-rendered shell when
+        // fetched from the main process, even though the page is valid and
+        // the watermark provider can resolve its video resource. Keep the
+        // formal thread/share URL and let the downstream MP4 validation be
+        // the final success gate instead of rejecting the dynamic shell.
+        if (errorMessage(error) === "复制出的豆包分享页没有包含当前视频资源") {
           result = { shareUrl, reason: null };
           return true;
-        } catch (error) {
-          result = { shareUrl: null, reason: errorMessage(error) };
-          return false;
         }
-      };
-
-      let shareState = await inspectShareSelection(win);
-
-      if (!shareState.active) {
-        await openShareSelection(win);
-        const directlyCopiedUrl = extractDoubaoShareUrl(clipboard.readText());
-        if (directlyCopiedUrl) {
-          if (await acceptCopiedShareUrl(directlyCopiedUrl)) return result;
-        }
-        shareState = await waitForShareSelection(win, SHARE_PANEL_WAIT_MS);
+        result = { shareUrl: null, reason: errorMessage(error) };
+        return false;
       }
+    };
 
-      if (!shareState.active) {
-        if (!result.reason || result.reason === "未找到分享面板") {
-          result = { shareUrl: null, reason: "未打开分享面板" };
-        }
-        return result;
-      }
+    let shareState = await inspectShareSelection(win);
 
-      if (!shareState.allSelected) {
-        const selectAllPoint = await waitForTextControlPoint(win, ["全选"], [], 1800);
-        if (selectAllPoint) {
-          await sendMouseClick(win, selectAllPoint.x, selectAllPoint.y);
-          shareState = await waitForShareSelection(win, 1200);
-        }
+    if (!shareState.active) {
+      await openShareSelection(win);
+      const directlyCapturedUrl = await waitForPageCapturedShareUrl(win, 450);
+      if (directlyCapturedUrl) {
+        if (await acceptCapturedShareUrl(directlyCapturedUrl)) return result;
       }
-
-      // The copy button starts disabled while the share panel settles or until
-      // the target content is selected. Poll for it instead of failing on the
-      // first inspection so a slow panel is not treated as a failed copy.
-      if (!shareState.copyEnabled) {
-        shareState = await waitForShareCopyEnabled(win, SHARE_PANEL_WAIT_MS);
-      }
-
-      const copyPoint = await waitForTextControlPoint(win, ["复制链接"], [], 1800);
-      if (!copyPoint) {
-        result = { shareUrl: null, reason: "未找到复制链接控件" };
-        return result;
-      }
-      if (!shareState.copyEnabled && shareState.checkboxCount > 0) {
-        result = { shareUrl: null, reason: "复制链接按钮未启用" };
-        return result;
-      }
-
-      // A native input event is the reliable path for Doubao's clipboard handler.
-      await sendMouseClick(win, copyPoint.x, copyPoint.y);
-      const nativeCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
-      if (nativeCopiedUrl) {
-        if (await acceptCopiedShareUrl(nativeCopiedUrl)) return result;
-      }
-
-      // Keep a DOM click as a bounded fallback for versions that render the
-      // clickable label separately from the visible button surface.
-      await clickByKeywords(win, ["复制链接"]);
-      const domCopiedUrl = await waitForClipboardShareUrl(CLIPBOARD_WAIT_MS);
-      if (domCopiedUrl) {
-        await acceptCopiedShareUrl(domCopiedUrl);
-      } else if (!result.reason) {
-        result = { shareUrl: null, reason: "点击复制链接后剪贴板未出现豆包分享地址" };
-      }
-      return result;
-    } catch (error) {
-      // Share panels are animated and can be replaced while the generation card
-      // updates. Treat a transient inspection error as a retryable miss.
-      console.warn("豆包复制分享链接暂时失败", error);
-      result = { shareUrl: null, reason: `复制控件检查异常：${errorMessage(error)}` };
-      return result;
-    } finally {
-      if (!result.shareUrl) restoreClipboardAfterFailedShare(before, clipboardSentinel);
+      shareState = await waitForShareSelection(win, SHARE_PANEL_WAIT_MS);
     }
-  });
+
+    if (!shareState.active) {
+      if (!result.reason || result.reason === "未找到分享面板") {
+        result = { shareUrl: null, reason: "未打开分享面板" };
+      }
+      return result;
+    }
+
+    if (!shareState.allSelected) {
+      const selectAllPoint = await waitForTextControlPoint(win, ["全选"], [], 1800);
+      if (selectAllPoint) {
+        await sendMouseClick(win, selectAllPoint.x, selectAllPoint.y);
+        shareState = await waitForShareSelection(win, 1200);
+      }
+    }
+
+    // The copy button starts disabled while the share panel settles or until
+    // the target content is selected. Poll for it instead of failing on the
+    // first inspection so a slow panel is not treated as a failed copy.
+    if (!shareState.copyEnabled) {
+      shareState = await waitForShareCopyEnabled(win, SHARE_PANEL_WAIT_MS);
+    }
+
+    const copyPoint = await waitForTextControlPoint(win, ["复制链接"], [], 1800);
+    if (!copyPoint) {
+      return { shareUrl: null, reason: "未找到复制链接控件" };
+    }
+    if (!shareState.copyEnabled && shareState.checkboxCount > 0) {
+      return { shareUrl: null, reason: "复制链接按钮未启用" };
+    }
+
+    // Native mouse click remains the reliable trigger, but the generated URL is
+    // read from the page capture instead of Electron's process-wide clipboard.
+    await clearPageCapturedShareUrl(win);
+    await sendMouseClick(win, copyPoint.x, copyPoint.y);
+    const nativeCapturedUrl = await waitForPageCapturedShareUrl(win, PAGE_SHARE_CAPTURE_WAIT_MS);
+    if (nativeCapturedUrl) {
+      if (await acceptCapturedShareUrl(nativeCapturedUrl)) return result;
+    }
+
+    // Keep a DOM click as a bounded fallback for versions that render the
+    // clickable label separately from the visible button surface.
+    await clearPageCapturedShareUrl(win);
+    await clickByKeywords(win, ["复制链接"]);
+    const domCapturedUrl = await waitForPageCapturedShareUrl(win, PAGE_SHARE_CAPTURE_WAIT_MS);
+    if (domCapturedUrl) {
+      await acceptCapturedShareUrl(domCapturedUrl);
+    } else if (!result.reason) {
+      result = { shareUrl: null, reason: await getPageShareLinkFailureReason(win) };
+    }
+    return result;
+  } catch (error) {
+    // Share panels are animated and can be replaced while the generation card
+    // updates. Treat a transient inspection error as a retryable miss.
+    console.warn("豆包复制分享链接暂时失败", error);
+    result = { shareUrl: null, reason: `复制控件检查异常：${errorMessage(error)}` };
+    return result;
+  }
 }
 
 async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
@@ -1830,19 +2750,136 @@ async function dismissDoubaoDesktopDownloadPrompt(win: BrowserWindow) {
   return true;
 }
 
-async function waitForClipboardShareUrl(timeoutMs = CLIPBOARD_WAIT_MS) {
+async function installDoubaoPageClipboardCapture(win: BrowserWindow) {
+  return runPageScript<boolean>(win, `
+    (() => {
+      const stateKey = "__doubaoShareCapture";
+      const previousState = window[stateKey];
+      if (previousState?.installed) {
+        previousState.url = null;
+        previousState.sawChatUrl = false;
+        previousState.lastWriteAt = 0;
+        return true;
+      }
+
+      const extractWatermarkShareUrl = (value) => {
+        const matched = String(value || "").match(/https?:\\/\\/(?:www\\.)?doubao\\.com\\/(?:thread|share)\\/[A-Za-z0-9._~-]+(?:[\\/?#][^\\s"'<>]*)?/i)?.[0];
+        return matched?.replace(/[)\\]}>，。！？；;]+$/, "") || null;
+      };
+      const isChatUrl = (value) => /https?:\\/\\/(?:www\\.)?doubao\\.com\\/chat\\//i.test(String(value || ""));
+      const originalClipboard = navigator.clipboard;
+      const state = {
+        installed: true,
+        url: null,
+        sawChatUrl: false,
+        lastWriteAt: 0
+      };
+      const captureText = (value) => {
+        const text = String(value || "");
+        const shareUrl = extractWatermarkShareUrl(text);
+        if (shareUrl) state.url = shareUrl;
+        if (isChatUrl(text)) state.sawChatUrl = true;
+        state.lastWriteAt = Date.now();
+      };
+      const captureItem = async (item) => {
+        for (const type of Array.from(item?.types || [])) {
+          try {
+            const blob = await item.getType(type);
+            captureText(await blob.text());
+            if (state.url) return;
+          } catch {
+            // A ClipboardItem can expose image or HTML types that are not text.
+          }
+        }
+      };
+      const wrapper = {
+        writeText: async (text) => {
+          captureText(text);
+        },
+        write: async (items) => {
+          for (const item of Array.from(items || [])) {
+            await captureItem(item);
+            if (state.url) break;
+          }
+        },
+        readText: originalClipboard?.readText?.bind(originalClipboard) || (async () => ""),
+        read: originalClipboard?.read?.bind(originalClipboard) || (async () => [])
+      };
+      try {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: wrapper
+        });
+        Object.defineProperty(window, stateKey, {
+          configurable: true,
+          value: state
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    })()
+  `);
+}
+
+async function waitForPageCapturedShareUrl(win: BrowserWindow, timeoutMs = PAGE_SHARE_CAPTURE_WAIT_MS) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const shareUrl = extractDoubaoShareUrl(clipboard.readText());
+    const shareUrl = await readPageCapturedShareUrl(win);
     if (shareUrl) return shareUrl;
     await wait(Math.min(150, Math.max(25, timeoutMs - (Date.now() - startedAt))));
   }
-  return extractDoubaoShareUrl(clipboard.readText());
+  return readPageCapturedShareUrl(win);
+}
+
+async function readPageCapturedShareUrl(win: BrowserWindow) {
+  if (win.isDestroyed()) return null;
+  return runPageScript<string | null>(win, `
+    (() => window.__doubaoShareCapture?.url || null)()
+  `);
+}
+
+async function clearPageCapturedShareUrl(win: BrowserWindow) {
+  if (win.isDestroyed()) return;
+  await runPageScript<void>(win, `
+    (() => {
+      if (window.__doubaoShareCapture) {
+        window.__doubaoShareCapture.url = null;
+        window.__doubaoShareCapture.sawChatUrl = false;
+      }
+    })()
+  `);
+}
+
+async function getPageShareLinkFailureReason(win: BrowserWindow) {
+  const state = await runPageScript<{ sawChatUrl?: boolean } | null>(win, `
+    (() => window.__doubaoShareCapture || null)()
+  `).catch(() => null);
+  if (state?.sawChatUrl) {
+    return "豆包复制的是 chat 对话地址，不是可去水印的 thread/share 分享地址";
+  }
+  return "点击复制链接后页面未捕获到可去水印的豆包 thread/share 分享地址";
 }
 
 async function primeGeneratedVideoCard(win: BrowserWindow) {
-  const revealed = await runPageScript<boolean>(win, `
+  const cardPoint = await runPageScript<{ x: number; y: number; needsClick: boolean } | null>(win, `
     (() => {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
+      const scrollContainers = Array.from(document.querySelectorAll("*"))
+        .filter((el) => {
+          const style = getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return rect.width > 120
+            && rect.height > 120
+            && rect.bottom >= 0
+            && rect.top <= window.innerHeight
+            && el.scrollHeight > el.clientHeight + 80
+            && /(auto|scroll)/i.test(style.overflowY);
+        })
+        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+      for (const container of scrollContainers.slice(0, 4)) {
+        container.scrollTop = container.scrollHeight;
+      }
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -1851,28 +2888,48 @@ async function primeGeneratedVideoCard(win: BrowserWindow) {
           && style.visibility !== "hidden"
           && style.display !== "none";
       };
-      const posters = Array.from(document.querySelectorAll("img"))
+      const mediaCandidates = Array.from(document.querySelectorAll(
+        "video, img, canvas, [class*='block-video'], [class*='video-card'], [data-video-url], [data-download-url]"
+      ))
         .filter(visible)
         .map((el) => {
           const rect = el.getBoundingClientRect();
+          const className = typeof el.className === "string" ? el.className : "";
           const source = [
             el.currentSrc,
             el.src,
             el.getAttribute("src"),
             el.getAttribute("data-src")
           ].filter(Boolean).join(" ");
-          return { el, rect, source };
+          return { el, rect, source, className };
         })
-        .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source))
-        .sort((a, b) => b.rect.bottom - a.rect.bottom);
-      const target = posters[0];
-      if (!target) return false;
+        .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source)
+          || /block-video|video-card/i.test(item.className))
+        .sort((a, b) => Number(/block-video|video-card/i.test(b.className))
+          - Number(/block-video|video-card/i.test(a.className))
+          || b.rect.bottom - a.rect.bottom);
+      const target = mediaCandidates[0];
+      if (!target) return null;
       target.el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
       target.el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
-      return true;
+      const visibleVideoCount = Array.from(document.querySelectorAll("video")).filter(visible).length;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        // New Doubao cards render the actual <video> and toolbar after the
+        // card is physically clicked. Avoid toggling playback when it is
+        // already mounted, but always move the native pointer onto the card
+        // so the hover-only toolbar is actually rendered.
+        needsClick: visibleVideoCount === 0
+      };
     })()
   `);
-  if (!revealed) return false;
+  if (!cardPoint) return false;
+  await sendMouseMove(win, cardPoint.x, cardPoint.y);
+  if (cardPoint.needsClick) {
+    await sendMouseClick(win, cardPoint.x, cardPoint.y);
+    await wait(900);
+  }
   const startedAt = Date.now();
   while (Date.now() - startedAt < 8000) {
     await wait(500);
@@ -1882,7 +2939,9 @@ async function primeGeneratedVideoCard(win: BrowserWindow) {
       break;
     }
   }
-  await sendKeyboard(win, "ESC", undefined, 350);
+  // The current Doubao video card exposes its share toolbar only while the
+  // card remains hovered. Do not press Escape here: it dismisses that toolbar
+  // on newer builds before openShareSelection can click it.
   await wait(800);
   return true;
 }
@@ -1922,13 +2981,6 @@ async function waitForTextControlPoint(
   return point;
 }
 
-function restoreClipboardAfterFailedShare(before: string, sentinel: string) {
-  const current = clipboard.readText();
-  if (current === sentinel || !extractDoubaoShareUrl(current)) {
-    clipboard.writeText(before);
-  }
-}
-
 async function inspectShareSelection(win: BrowserWindow) {
   return runPageScript<{
     active: boolean;
@@ -1953,12 +3005,14 @@ async function inspectShareSelection(win: BrowserWindow) {
       const controls = Array.from(document.querySelectorAll('button, [role="button"], [aria-label], [title], [tabindex]'))
         .filter(visible);
       const copyControls = controls.filter((el) => textOf(el).includes("复制链接"));
-      const allText = (document.body?.innerText || "").replace(/\\s+/g, " ");
       const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]')).filter(visible);
       const checked = checkboxes.filter((el) => el.checked === true || el.getAttribute("aria-checked") === "true");
       const copyEnabled = copyControls.some((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
       return {
-        active: copyControls.length > 0 && allText.includes("全选"),
+        // A conversation containing one video can open a share panel without
+        // rendering the multi-select “全选” control. The visible “复制链接”
+        // control is the reliable panel marker in both layouts.
+        active: copyControls.length > 0,
         hasSelection: checked.length > 0 || (checkboxes.length === 0 && copyEnabled),
         allSelected: checkboxes.length === 0 ? copyEnabled : checked.length === checkboxes.length,
         checkboxCount: checkboxes.length,
@@ -1970,6 +3024,16 @@ async function inspectShareSelection(win: BrowserWindow) {
 }
 
 async function openShareSelection(win: BrowserWindow) {
+  // The current Doubao build places the share action in the message toolbar,
+  // outside the video element's DOM subtree. Its share SVG starts with the
+  // stable path used by the native share action. Search this toolbar first so
+  // we do not click a page-level header action or an unrelated message.
+  const knownSharePoint = await waitForDoubaoVideoToolbarSharePoint(win, 3000);
+  if (knownSharePoint) {
+    await sendMouseClick(win, knownSharePoint.x, knownSharePoint.y);
+    if ((await waitForShareSelection(win, SHARE_PANEL_WAIT_MS)).active) return true;
+  }
+
   const cardSharePoint = await waitForVideoCardSharePoint(win, 5000);
   if (cardSharePoint) {
     await sendMouseClick(win, cardSharePoint.x, cardSharePoint.y);
@@ -2010,6 +3074,90 @@ async function openShareSelection(win: BrowserWindow) {
   return false;
 }
 
+async function waitForDoubaoVideoToolbarSharePoint(win: BrowserWindow, timeoutMs: number) {
+  const startedAt = Date.now();
+  let point = await findDoubaoVideoToolbarSharePoint(win);
+  while (!point && Date.now() - startedAt < timeoutMs) {
+    await wait(180);
+    point = await findDoubaoVideoToolbarSharePoint(win);
+  }
+  return point;
+}
+
+async function findDoubaoVideoToolbarSharePoint(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number } | null>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom >= 0 && rect.top <= window.innerHeight
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none";
+      };
+      const media = Array.from(document.querySelectorAll(
+        "video, img, canvas, [class*='block-video'], [class*='video-card'], [data-video-url], [data-download-url]"
+      ))
+        .filter(visible)
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          const className = typeof el.className === "string" ? el.className : "";
+          const source = [
+            el.currentSrc,
+            el.src,
+            el.getAttribute("src"),
+            el.getAttribute("data-src"),
+            el.getAttribute("data-video-url"),
+            el.getAttribute("data-download-url")
+          ].filter(Boolean).join(" ");
+          return { el, rect, className, source };
+        })
+        .filter((item) => /block-video|video-card/i.test(item.className)
+          || /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source))
+        .sort((a, b) => b.rect.bottom - a.rect.bottom)[0];
+      if (!media) return null;
+
+      const mediaRect = media.rect;
+      const mediaRoot = (() => {
+        let current = media.el;
+        for (let level = 0; current && level < 14; level += 1, current = current.parentElement) {
+          const text = (current.innerText || "").replace(/\\s+/g, " ");
+          if (/你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])/.test(text)) {
+            return current;
+          }
+        }
+        return media.el.parentElement;
+      })();
+      const rootRect = mediaRoot?.getBoundingClientRect();
+      const paths = Array.from(document.querySelectorAll("svg path[d]"))
+        .filter(visible)
+        .filter((path) => /^M11\\.052/.test(path.getAttribute("d") || ""))
+        .map((path) => {
+          const button = path.closest("button, [role=\\"button\\"], [tabindex], a") || path;
+          const rect = button.getBoundingClientRect();
+          return { rect };
+        })
+        .filter((item) => item.rect.width <= 80 && item.rect.height <= 80)
+        .filter((item) => item.rect.bottom >= Math.max(0, mediaRect.top - 220)
+          && item.rect.top <= mediaRect.bottom + 280)
+        .filter((item) => !rootRect
+          || (item.rect.left + item.rect.width / 2 >= rootRect.left - 40
+            && item.rect.right - item.rect.width / 2 <= rootRect.right + 40));
+      const target = paths
+        .sort((a, b) => {
+          const aDistance = Math.abs((a.rect.top + a.rect.height / 2) - mediaRect.bottom);
+          const bDistance = Math.abs((b.rect.top + b.rect.height / 2) - mediaRect.bottom);
+          return aDistance - bDistance;
+        })[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2)
+      };
+    })()
+  `);
+}
+
 async function waitForVideoCardSharePoint(win: BrowserWindow, timeoutMs: number) {
   const startedAt = Date.now();
   let point = await findVideoCardSharePoint(win);
@@ -2035,10 +3183,13 @@ async function findVideoCardSharePoint(win: BrowserWindow) {
         el.getAttribute("aria-label"),
         el.getAttribute("title")
       ].filter(Boolean).join(" ").replace(/\\s+/g, " ").trim();
-      const media = Array.from(document.querySelectorAll("video, img"))
+      const mediaCandidates = Array.from(document.querySelectorAll(
+        "video, img, canvas, [class*='block-video'], [class*='video-card'], [data-video-url], [data-download-url]"
+      ))
         .filter(visible)
         .map((el) => {
           const rect = el.getBoundingClientRect();
+          const className = typeof el.className === "string" ? el.className : "";
           const source = [
             el.currentSrc,
             el.src,
@@ -2047,9 +3198,34 @@ async function findVideoCardSharePoint(win: BrowserWindow) {
             el.getAttribute("data-video-url"),
             el.getAttribute("data-download-url")
           ].filter(Boolean).join(" ");
-          return { el, rect, source };
-        })
-        .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source))
+          return { el, rect, source, className };
+        });
+      const knownVideoMedia = mediaCandidates
+        .filter((item) => /video[_-]|video.*watermark|video_dsz|tplv[^ ]*video/i.test(item.source)
+          || /block-video|video-card/i.test(item.className));
+      const completionMedia = [];
+      const completionTextNodes = Array.from(document.querySelectorAll("*"))
+        .filter((el) => {
+          const ownText = Array.from(el.childNodes)
+            .filter((node) => node.nodeType === Node.TEXT_NODE)
+            .map((node) => node.textContent || "")
+            .join(" ")
+            .replace(/\\s+/g, " ")
+            .trim();
+          return /你的视频(?:已经|已)?生成好[了啦]|视频(?:已经|已)?生成(?:完成|成功|好[了啦])|生成视频(?:已经|已)?完成/.test(ownText);
+        });
+      for (const node of completionTextNodes) {
+        let ancestor = node;
+        for (let level = 0; ancestor && level < 8; level += 1, ancestor = ancestor.parentElement) {
+          const media = mediaCandidates.filter((item) => ancestor.contains(item.el));
+          if (media.length) {
+            completionMedia.push(...media);
+            break;
+          }
+        }
+      }
+      const media = Array.from(new Map([...knownVideoMedia, ...completionMedia]
+        .map((item) => [item.el, item])).values())
         .sort((a, b) => b.rect.bottom - a.rect.bottom)[0];
       if (!media) return null;
 
@@ -2059,7 +3235,9 @@ async function findVideoCardSharePoint(win: BrowserWindow) {
           .filter(visible)
           .map((el) => {
             const rect = el.getBoundingClientRect();
-            return { el, rect, text: textOf(el) };
+            const sharePath = Array.from(el.querySelectorAll("svg path"))
+              .some((path) => /^M11\\.052/.test(path.getAttribute("d") || ""));
+            return { el, rect, text: textOf(el), sharePath };
           })
           .filter((item) => item.rect.width <= 240 && item.rect.height <= 100
             && item.rect.bottom >= media.rect.top - 100
@@ -2069,6 +3247,12 @@ async function findVideoCardSharePoint(win: BrowserWindow) {
           .sort((a, b) => Number(/分享图片|分享/.test(b.text)) - Number(/分享图片|分享/.test(a.text)));
         if (labeled[0]) {
           const rect = labeled[0].rect;
+          return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+        }
+
+        const iconShare = controls.find((item) => item.sharePath);
+        if (iconShare) {
+          const rect = iconShare.rect;
           return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
         }
 
@@ -2195,16 +3379,15 @@ async function findOverflowMenuPoint(win: BrowserWindow) {
   `);
 }
 
-async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 2600) {
+async function waitForSubmittedConversationUrl(win: BrowserWindow, timeoutMs = 8000) {
   let conversationUrl = extractDoubaoConversationUrl(win.webContents.getURL());
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs
-    && (!conversationUrl || /\/chat\/local_/i.test(conversationUrl))) {
+  while (Date.now() - startedAt < timeoutMs && !isFormalDoubaoConversationUrl(conversationUrl)) {
     await wait(200);
     const currentUrl = extractDoubaoConversationUrl(win.webContents.getURL());
     if (currentUrl) conversationUrl = currentUrl;
   }
-  return conversationUrl;
+  return isFormalDoubaoConversationUrl(conversationUrl) ? conversationUrl : null;
 }
 
 async function findShareIconPoint(win: BrowserWindow) {
@@ -2340,6 +3523,25 @@ async function getRawPageText(win: BrowserWindow) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
+}
+
+function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "prompt">) {
+  const model = request.model === "seedance_2_0_mini" ? "mini" : "fast";
+  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${extractPromptDuration(request.prompt) || "未指定"}`;
+}
+
+function extractPromptDuration(prompt: string) {
+  const text = prompt.replace(/\s+/g, " ");
+  const explicit = text.match(/(?:总?时长|视频时长|持续时间)\s*[:：]?\s*(\d+(?:\s*[-—–~至]\s*\d+)?)\s*(?:秒|s)(?![a-z])/i);
+  if (explicit?.[1]) return `${explicit[1].replace(/\s+/g, "")}秒`;
+
+  // Prompts often contain segment timings such as "留 1 秒" and put the
+  // actual total duration at the end. Prefer the final complete duration
+  // marker when there is no explicit duration label.
+  const durations = Array.from(text.matchAll(/(?<!\d)(\d+(?:\s*[-—–~至]\s*\d+)?)\s*(?:秒|s)(?![a-z])/gi));
+  const last = durations.at(-1);
+  if (last?.[1]) return `${last[1].replace(/\s+/g, "")}秒`;
+  return null;
 }
 
 function operationAction(message: string, status?: ApiRequestStatus) {

@@ -1,6 +1,7 @@
 export type LoginStatus = "unknown" | "logged_in" | "logged_out";
 export type AccountRuntimeStatus = "idle" | "busy" | "error" | "login_required";
 export type DoubaoModel = "seedance_2_0_mini" | "seedance_2_0_fast";
+export type DoubaoAspectRatio = "9:16" | "16:9";
 export type ApiRequestStatus = "accepted" | "running" | "success" | "failed" | "stopped";
 export type OperationLogStatus = "info" | "success" | "failed";
 
@@ -62,6 +63,7 @@ export interface ApiRequest {
   requestId: string;
   source: string;
   model: DoubaoModel;
+  aspectRatio: DoubaoAspectRatio;
   accountId: number | null;
   accountName: string | null;
   accountPartition: string | null;
@@ -75,6 +77,7 @@ export interface ApiRequest {
   rawVideoUrl: string | null;
   cleanVideoUrl: string | null;
   outputVideoPath: string | null;
+  quotaRefunded: boolean;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -84,6 +87,7 @@ export interface ApiRequestCreateInput {
   requestId: string;
   source?: string;
   model: DoubaoModel;
+  aspectRatio?: DoubaoAspectRatio | null;
   accountId?: number | null;
   status: ApiRequestStatus;
   message?: string;
@@ -91,6 +95,7 @@ export interface ApiRequestCreateInput {
   referenceImagePath?: string | null;
   removeWatermark?: boolean;
   callbackUrl?: string | null;
+  quotaCost?: number;
 }
 
 export interface ApiRequestUpdateInput {
@@ -136,6 +141,7 @@ export interface ApiServerStatus {
 
 export interface GenerateRequestBody {
   model?: DoubaoModel;
+  aspectRatio?: DoubaoAspectRatio | string | null;
   prompt: string;
   referenceImagePath?: string | null;
   referenceImageUrl?: string | null;

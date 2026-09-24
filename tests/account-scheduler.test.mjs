@@ -74,3 +74,47 @@ test('honors the configured concurrency limit', async () => {
   await nextTurn()
   assert.deepEqual(started, ['first', 'second'])
 })
+
+test('removes a cancelled pending task without running it', async () => {
+  const firstGate = deferred()
+  const started = []
+  const scheduler = new AccountTaskScheduler(
+    () => 1,
+    async (item) => {
+      started.push(item.key)
+      if (item.key === 'first') await firstGate.promise
+    },
+  )
+
+  scheduler.enqueue({ key: 'first', accountId: 1 })
+  scheduler.enqueue({ key: 'cancelled', accountId: 2 })
+  await nextTurn()
+  assert.equal(scheduler.isActive('first'), true)
+  assert.equal(scheduler.cancel('cancelled'), true)
+
+  firstGate.resolve()
+  await nextTurn()
+  assert.deepEqual(started, ['first'])
+  assert.equal(scheduler.cancel('cancelled'), false)
+})
+
+test('releases concurrency immediately when an active task is cancelled', async () => {
+  const firstGate = deferred()
+  const started = []
+  const scheduler = new AccountTaskScheduler(
+    () => 1,
+    async (item) => {
+      started.push(item.key)
+      if (item.key === 'first') await firstGate.promise
+    },
+  )
+
+  scheduler.enqueue({ key: 'first', accountId: 1 })
+  scheduler.enqueue({ key: 'second', accountId: 2 })
+  await nextTurn()
+  assert.equal(scheduler.cancel('first'), true)
+  await nextTurn()
+  assert.deepEqual(started, ['first', 'second'])
+
+  firstGate.resolve()
+})
