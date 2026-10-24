@@ -30,6 +30,14 @@ export function doubaoAspectRatioFromText(value: string | null | undefined) {
   return has916 ? "9:16" : "16:9";
 }
 
+export function doubaoDurationFromText(value: string | null | undefined): number | null {
+  const text = String(value || "").replace(/\s+/g, "");
+  const match = text.match(/(?:^|[·•|,/—-])?(\d+(?:\.\d+)?)(?:s|秒)$/i);
+  if (!match) return null;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
 export function isDoubaoAspectRatioTriggerText(value: string | null | undefined) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text || text.length > 48) return false;

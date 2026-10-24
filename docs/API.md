@@ -35,12 +35,13 @@ Authorization: Bearer <api-key>
 Content-Type: multipart/form-data
 ```
 
-也可以使用 JSON 提交；`aspectRatio` 会保存到任务记录，并在豆包窗口发送前设置和校验。
+也可以使用 JSON 提交；`aspectRatio` 和 `duration` 会保存到任务记录，并在豆包窗口发送前设置和校验。
 
 ```json
 {
   "model": "seedance_2_0_mini",
   "aspectRatio": "9:16",
+  "duration": 15,
   "prompt": "生成一段 5 秒视频"
 }
 ```
@@ -53,6 +54,7 @@ Content-Type: multipart/form-data
 | `model` | 否 | `seedance_2_0_mini` 或 `seedance_2_0_fast` |
 | `accountId` | 否 | 正整数账号 ID；省略则自动调度；指定账号不可用或余额不足时返回 409，不会偷偷换用其他账号 |
 | `aspectRatio` | 否 | `9:16` 或 `16:9`；省略时默认 `16:9`，保存到任务并在豆包窗口发送前校验 |
+| `duration` | 否 | 视频时长（秒），`4` 到 `15` 的整数；省略时默认 `10`，保存到任务并在豆包窗口发送前通过「画幅/时长」设置弹窗选择和校验 |
 | `referenceImage` | 否 | 上传的参考图片文件 |
 | `referenceImagePath` | 否 | 本机参考图片绝对路径 |
 | `referenceImageUrl` | 否 | 可下载的参考图片 URL |

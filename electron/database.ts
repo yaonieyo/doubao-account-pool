@@ -107,6 +107,7 @@ export class AppDatabase {
         source TEXT NOT NULL DEFAULT 'local',
         model TEXT NOT NULL,
         aspect_ratio TEXT NOT NULL DEFAULT '16:9',
+        duration_seconds INTEGER NOT NULL DEFAULT 10,
         account_id INTEGER,
         status TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
@@ -588,6 +589,7 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS duration,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -646,6 +648,7 @@ export class AppDatabase {
         api_requests.source,
         api_requests.model,
         api_requests.aspect_ratio AS aspectRatio,
+        api_requests.duration_seconds AS duration,
         api_requests.account_id AS accountId,
         api_requests.requested_account_id AS requestedAccountId,
         api_requests.assignment_revision AS assignmentRevision,
@@ -688,6 +691,7 @@ export class AppDatabase {
         source,
         model,
         aspect_ratio,
+        duration_seconds,
         account_id,
         requested_account_id,
         status,
@@ -704,12 +708,13 @@ export class AppDatabase {
         updated_at,
         finished_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.requestId,
       input.source || "local-api",
       input.model,
       input.aspectRatio || "16:9",
+      clampInt(input.duration || 10),
       input.accountId ?? null,
       input.requestedAccountId ?? null,
       input.status,
@@ -1012,6 +1017,7 @@ export class AppDatabase {
   private ensureApiRequestColumns() {
     this.addColumnIfMissing("api_requests", "source", "TEXT NOT NULL DEFAULT 'local'");
     this.addColumnIfMissing("api_requests", "aspect_ratio", "TEXT NOT NULL DEFAULT '16:9'");
+    this.addColumnIfMissing("api_requests", "duration_seconds", "INTEGER NOT NULL DEFAULT 10");
     this.addColumnIfMissing("api_requests", "reference_image_path", "TEXT");
     this.addColumnIfMissing("api_requests", "remove_watermark", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("api_requests", "callback_url", "TEXT");
@@ -1115,6 +1121,7 @@ function normalizeApiRequest(row: unknown): ApiRequest {
   return {
     ...values,
     aspectRatio: request.aspectRatio === "9:16" || request.aspectRatio === "16:9" ? request.aspectRatio : "16:9",
+    duration: Number(request.duration) >= 4 && Number(request.duration) <= 15 ? Number(request.duration) : 10,
     removeWatermark: Boolean(request.removeWatermark),
     quotaRefunded: Boolean(request.quotaRefunded),
     quotaReserved: Boolean(request.quotaReserved),
