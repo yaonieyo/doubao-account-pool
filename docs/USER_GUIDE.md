@@ -178,6 +178,7 @@ curl -X POST http://127.0.0.1:17888/api/generate \
   -d '{
     "model": "seedance_2_0_mini",
     "aspectRatio": "16:9",
+    "duration": 15,
     "prompt": "生成一段10秒、16:9横屏的女性科普动画，不要字幕，不要水印。",
     "source": "infinite-canvas"
   }'
@@ -188,7 +189,7 @@ curl -X POST http://127.0.0.1:17888/api/generate \
 - `seedance_2_0_mini`
 - `seedance_2_0_fast`
 
-当前接口支持独立的 `aspectRatio` 字段，账号池会在豆包窗口中选择并校验 `9:16` 或 `16:9`。时长仍建议写入提示词，最终结果以豆包实际生成状态和 MP4 文件为准。
+当前接口支持独立的 `aspectRatio` 字段，账号池会在豆包窗口中选择并校验 `9:16` 或 `16:9`。也支持独立的 `duration` 字段（`4` 到 `15` 的整数，省略时默认 `10`），账号池会通过豆包的「画幅 · 时长」设置弹窗选择并校验时长档位（例如 `15s`）；最终结果以豆包实际生成状态和 MP4 文件为准。
 
 ## 9. 提交参考图
 

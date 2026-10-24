@@ -106,6 +106,7 @@ export interface ApiRequest {
   source: string;
   model: DoubaoModel;
   aspectRatio: DoubaoAspectRatio;
+  duration: number;
   accountId: number | null;
   requestedAccountId: number | null;
   assignmentRevision: number;
@@ -140,6 +141,7 @@ export interface ApiRequestCreateInput {
   source?: string;
   model: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | null;
+  duration?: number | null;
   accountId?: number | null;
   requestedAccountId?: number | null;
   status: ApiRequestStatus;
@@ -204,6 +206,7 @@ export interface GenerateRequestBody {
   accountId?: number | string;
   model?: DoubaoModel;
   aspectRatio?: DoubaoAspectRatio | string | null;
+  duration?: number | string | null;
   prompt: string;
   referenceImagePath?: string | null;
   referenceImageUrl?: string | null;

@@ -6,6 +6,19 @@ import { app, BrowserWindow } from 'electron'
 import Database from 'better-sqlite3'
 import http from 'node:http'
 
+// Windows 下 Chromium profile（如 DIPS）在窗口销毁后仍被短暂锁定，直接删目录会 EBUSY，重试吸收释放延迟
+function rmSyncWithRetry(target, options, attempts = 8) {
+  for (let i = 0; ; i++) {
+    try {
+      return fs.rmSync(target, options)
+    } catch (error) {
+      if (i >= attempts - 1 || !['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error.code)) throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250)
+    }
+  }
+}
+
+
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'doubao-isolated-db-'))
 app.setPath('userData', profile)
 app.on('window-all-closed', () => {})
@@ -129,7 +142,8 @@ app.whenReady().then(async () => {
   console.error(error)
   exitCode = 1
 } finally {
-  fs.rmSync(profile, { recursive: true, force: true })
+  try { rmSyncWithRetry(profile, { recursive: true, force: true }) }
+  catch (cleanupError) { console.error('PROFILE_RM_FAIL', cleanupError.code, String(cleanupError.message).slice(0, 140)) }
 }
   app.exit(exitCode)
 })

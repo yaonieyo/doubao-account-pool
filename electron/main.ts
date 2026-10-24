@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, ipcMain, powerMonitor, session } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, powerMonitor, session } from "electron";
 import { DailyQuotaTimer } from "./quota-clock.js";
 import { doubaoDailyQuotaError } from "./doubao-quota-state.js";
 import log from "electron-log/main.js";
@@ -171,6 +171,13 @@ class LocalApiServer {
           return;
         }
 
+        const duration = normalizeDuration(body.duration) || 10;
+        const rawDuration = body.duration;
+        if (rawDuration !== undefined && rawDuration !== null && rawDuration !== "" && !normalizeDuration(body.duration)) {
+          sendJson(response, 400, { error: "duration must be an integer between 4 and 15 (seconds)" });
+          return;
+        }
+
         const accountId = body.accountId === undefined ? undefined : Number(body.accountId);
         if (accountId !== undefined && (!Number.isSafeInteger(accountId) || accountId < 1)) {
           sendJson(response, 400, { error: "accountId must be a positive integer" });
@@ -178,7 +185,7 @@ class LocalApiServer {
         }
         const referenceImagePath = await prepareReferenceImage(body, requestId);
         refreshQuotas();
-        const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio,
+        const created = this.database.acceptApiRequest({ requestId, source: body.source, model, aspectRatio, duration,
           prompt, referenceImagePath, removeWatermark: true, callbackUrl: body.callbackUrl }, accountId);
 
         if (!created) {
@@ -188,6 +195,7 @@ class LocalApiServer {
             source: body.source,
             model,
             aspectRatio,
+            duration,
             status: "failed",
             message: pinnedExhausted ? "豆包今日免费次数已用完；本任务指定了账号，不自动换号" : accountId ? "指定账号未登录、不存在或该模型剩余额度不足" : "没有可用账号，或该模型剩余额度不足",
             accountId: pinnedExhausted ? accountId : undefined,
@@ -325,6 +333,59 @@ class LocalApiServer {
       sendJson(response, 500, { error: message });
     }
   }
+}
+
+function setupChineseMenu() {
+  // 与 Electron 默认菜单同构（role 保留全部快捷键与行为），仅标签中文化。
+  const menu = Menu.buildFromTemplate([
+    {
+      label: "文件",
+      submenu: [
+        { label: "关闭窗口", role: "close" }
+      ]
+    },
+    {
+      label: "编辑",
+      submenu: [
+        { label: "撤销", role: "undo" },
+        { label: "重做", role: "redo" },
+        { type: "separator" },
+        { label: "剪切", role: "cut" },
+        { label: "复制", role: "copy" },
+        { label: "粘贴", role: "paste" },
+        { label: "全选", role: "selectAll" }
+      ]
+    },
+    {
+      label: "视图",
+      submenu: [
+        { label: "重新加载", role: "reload" },
+        { label: "强制重新加载", role: "forceReload" },
+        { type: "separator" },
+        { label: "进入/退出全屏", role: "togglefullscreen" },
+        { type: "separator" },
+        { label: "实际大小", role: "resetZoom" },
+        { label: "放大", role: "zoomIn" },
+        { label: "缩小", role: "zoomOut" },
+        { type: "separator" },
+        { label: "切换开发者工具", role: "toggleDevTools" }
+      ]
+    },
+    {
+      label: "窗口",
+      submenu: [
+        { label: "最小化", role: "minimize" },
+        { label: "关闭窗口", role: "close" }
+      ]
+    },
+    {
+      label: "帮助",
+      submenu: [
+        { label: "关于豆包账号池", role: "about" }
+      ]
+    }
+  ]);
+  Menu.setApplicationMenu(menu);
 }
 
 function createMainWindow() {
@@ -535,6 +596,15 @@ function normalizeAspectRatio(value: unknown): DoubaoAspectRatio | null {
   return null;
 }
 
+function normalizeDuration(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const normalized = typeof value === "number"
+    ? value
+    : Number(String(value).replace(/\s+/g, "").replace(/(?:s|秒)$/i, ""));
+  if (!Number.isInteger(normalized) || normalized < 4 || normalized > 15) return null;
+  return normalized;
+}
+
 function isAuthorized(request: IncomingMessage, apiKey: string) {
   if (!apiKey.trim()) return true;
   return request.headers.authorization === `Bearer ${apiKey}`;
@@ -605,6 +675,7 @@ async function parseMultipartGenerateRequest(buffer: Buffer, contentType: string
     accountId: fields.accountId,
     model: fields.model as DoubaoModel | undefined,
     aspectRatio: fields.aspectRatio || null,
+    duration: fields.duration || null,
     prompt: fields.prompt || "",
     referenceImagePath: uploadedReferenceImagePath || fields.referenceImagePath || null,
     referenceImageUrl: fields.referenceImageUrl || null,
@@ -742,6 +813,7 @@ if (!hasSingleInstanceLock) {
 
   app.whenReady().then(async () => {
     log.initialize();
+    setupChineseMenu();
     db = new AppDatabase();
     executor = new DoubaoExecutor(db, notifyDataChanged, observeWatermarkResponse);
     apiServer = new LocalApiServer(db, executor);

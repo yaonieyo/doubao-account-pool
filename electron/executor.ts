@@ -10,6 +10,7 @@ import {
   extractNewDoubaoReply,
   extractDoubaoWatermarkShareUrl,
   doubaoAspectRatioFromText,
+  doubaoDurationFromText,
   isDoubaoAspectRatioTriggerText,
   doubaoVideoModelFromText,
   doubaoVideoModelLabel,
@@ -407,6 +408,20 @@ export class DoubaoExecutor {
               : `豆包画幅已确认：${aspectRatioResult.after}`
           });
         }
+
+        await progress({
+          requestId,
+          status: "running",
+          message: `正在设置豆包时长：${request.duration} 秒`
+        });
+        const durationResult = await selectDoubaoDuration(win!, request.duration);
+        await progress({
+          requestId,
+          status: "running",
+          message: durationResult.attempts > 0
+            ? `豆包时长已确认：${durationResult.before ? durationResult.before + " 秒" : "未识别"} -> ${durationResult.after} 秒（第 ${durationResult.attempts} 次）`
+            : `豆包时长已确认：${durationResult.after} 秒`
+        });
 
         await progress({
           requestId,
@@ -1370,6 +1385,12 @@ type DoubaoAspectRatioState = {
   labels: string[];
 };
 
+type DoubaoDurationState = {
+  currentDuration: number | null;
+  summary: string | null;
+  labels: string[];
+};
+
 async function inspectSelectedDoubaoAspectRatio(win: BrowserWindow) {
   return runPageScript<DoubaoAspectRatioState>(win, `
     (() => {
@@ -1670,6 +1691,647 @@ async function selectDoubaoAspectRatio(win: BrowserWindow, targetRatio: DoubaoAs
     `豆包画幅未确认：要求 ${targetRatio}，当前为 ${state.currentAspectRatio || "未识别"}`
       + `；页面 ${win.webContents.getURL()}`
       + `；可见画幅 ${state.labels.join(" | ") || "无"}`
+      + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
+  );
+}
+
+async function inspectSelectedDoubaoDurationState(win: BrowserWindow) {
+  return runPageScript<DoubaoDurationState>(win, `
+    (() => {
+      const durationFromText = ${doubaoDurationFromText.toString()};
+      const isTriggerText = ${isDoubaoAspectRatioTriggerText.toString()};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input[type="text"]'))
+        .filter((el) => visible(el) && !el.disabled && !el.readOnly)
+        .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const editor = editors[0] || null;
+      let composerRoot = editor;
+      for (let parent = editor?.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth += 1) {
+        const rect = parent.getBoundingClientRect();
+        if (rect.height > 520) break;
+        if (rect.width >= 260 && rect.bottom > window.innerHeight * 0.5) composerRoot = parent;
+      }
+      const sourceNodes = composerRoot
+        ? [composerRoot, ...Array.from(composerRoot.querySelectorAll('*'))]
+        : Array.from(document.querySelectorAll('body *'));
+      const items = sourceNodes
+        .filter(visible)
+        .map((el) => {
+          const interactive = el.closest('button, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]');
+          const clickable = interactive || (getComputedStyle(el).cursor === "pointer" ? el : null);
+          const rect = (clickable || el).getBoundingClientRect();
+          const text = textOf(el);
+          return {
+            el,
+            text,
+            duration: durationFromText(text),
+            summary: Boolean(clickable) && isTriggerText(text)
+              && (!composerRoot || composerRoot.contains(clickable)),
+            rect
+          };
+        })
+        .filter((item) => item.duration);
+      const trigger = items
+        .filter((item) => item.summary)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.text.length - b.text.length)[0];
+      return {
+        // The collapsed toolbar entry (for example "16:9 · 10s") is the only
+        // authoritative signal for the currently applied duration.
+        currentDuration: trigger?.duration || null,
+        summary: trigger?.text || null,
+        labels: items.map((item) => item.text).slice(0, 12)
+      };
+    })()
+  `);
+}
+
+async function findDoubaoDurationOptionPoints(win: BrowserWindow, seconds: number) {
+  return runPageScript<Array<{ x: number; y: number; debug: string }>>(win, `
+    (() => {
+      const target = ${JSON.stringify(String(seconds))};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && style.pointerEvents !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\\s+/g, "");
+      const unitRe = new RegExp("(?:^|[^0-9.])" + target + "s(?![0-9])", "i");
+      const secRe = new RegExp("(?:^|[^0-9])" + target + "秒");
+      const insideDurationMenu = (el) => {
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 9; depth += 1, parent = parent.parentElement) {
+          if (!visible(parent)) continue;
+          const rect = parent.getBoundingClientRect();
+          const text = compactText(parent);
+          if (rect.width <= 720
+            && rect.height <= 720
+            && ((text.includes("时长") && /\\d+(?:\\.\\d+)?s/i.test(text))
+              || (text.includes("比例") && text.includes("自动") && text.includes("9:16") && text.includes("16:9")))) {
+            return true;
+          }
+        }
+        return false;
+      };
+      const clickableOf = (el) => {
+        // Walk up to the nearest genuinely interactive ancestor. A bare
+        // [tabindex] match would grab Radix popper containers, which carry
+        // tabindex="-1" (programmatic focus only) and swallow the click.
+        let node = el;
+        while (node && node !== document.body) {
+          if (node.matches && node.matches('button, [role="button"], [role="option"], [role="menuitem"], [role="radio"], [role="tab"], a')) return node;
+          const ti = node.getAttribute ? node.getAttribute("tabindex") : null;
+          if (ti !== null && ti !== "-1") return node;
+          node = node.parentElement;
+        }
+        return el;
+      };
+      const classNameOf = (el) => (typeof el.className === "string" ? el.className : "");
+      const items = [];
+      for (const el of Array.from(document.querySelectorAll('body *')).filter(visible)) {
+        const compact = compactText(el);
+        if (!(unitRe.test(compact) || secRe.test(compact) || compact === target)) continue;
+        if (!insideDurationMenu(el)) continue;
+        // The settings popover scrolls (max-height 480px); bring the option
+        // into its visible box before measuring, or the click misses.
+        try { el.scrollIntoView({ block: "nearest" }); } catch {}
+        const clickable = clickableOf(el);
+        const rect = clickable.getBoundingClientRect();
+        // Find a point whose topmost element is exactly the clickable: if the
+        // option handler validates event.target, clicking a child (or a
+        // pointer-events:none span) is silently ignored.
+        let cx = Math.round(rect.left + rect.width / 2);
+        let cy = Math.round(rect.top + rect.height / 2);
+        let exactHit = document.elementFromPoint(cx, cy) === clickable;
+        if (!exactHit) {
+          const stepX = Math.max(4, rect.width / 6);
+          const stepY = Math.max(4, rect.height / 4);
+          outer: for (let y = rect.top + 2; y <= rect.bottom - 2; y += stepY) {
+            for (let x = rect.left + 2; x <= rect.right - 2; x += stepX) {
+              if (document.elementFromPoint(Math.round(x), Math.round(y)) === clickable) {
+                cx = Math.round(x);
+                cy = Math.round(y);
+                exactHit = true;
+                break outer;
+              }
+            }
+          }
+        }
+        const hit = document.elementFromPoint(cx, cy);
+        const blocked = Boolean(hit && hit !== clickable && !clickable.contains(hit) && !hit.contains(clickable));
+        const clickCompact = compactText(clickable);
+        const tier = clickCompact === target + "s" || clickCompact === target + "秒" ? 0
+          : unitRe.test(clickCompact) || secRe.test(clickCompact) ? 1
+          : clickCompact === target ? 2 : 3;
+        const cls = classNameOf(clickable).split(/\\s+/).filter(Boolean).slice(0, 2).join(".");
+        const attrs = [];
+        for (const name of (clickable.getAttributeNames ? clickable.getAttributeNames() : [])) {
+          if (/^(data-|aria-)/.test(name) && name !== "aria-hidden") {
+            const value = String(clickable.getAttribute(name) || "").slice(0, 18);
+            if (value) attrs.push(name.replace(/^(data-|aria-)/, "") + "=" + value);
+          }
+          if (attrs.length >= 3) break;
+        }
+        items.push({
+          clickable, rect, cx, cy, blocked, tier,
+          debug: (textOf(clickable) || textOf(el)).replace(/\\s+/g, " ").slice(0, 40)
+            + " <" + clickable.tagName.toLowerCase() + (cls ? "." + cls : "") + ">"
+            + (attrs.length ? "[" + attrs.join(",") + "]" : "")
+            + (exactHit ? "[精确命中]" : "")
+            + (blocked ? "[遮挡]" : "")
+        });
+      }
+      const dedup = items.filter((item, index) => items.findIndex((c) => c.clickable === item.clickable) === index);
+      dedup.sort((a, b) => a.tier - b.tier || Number(a.blocked) - Number(b.blocked)
+        || a.rect.width * a.rect.height - b.rect.width * b.rect.height || b.rect.bottom - a.rect.bottom);
+      return dedup.slice(0, 4).map((item) => ({ x: item.cx, y: item.cy, debug: item.debug }));
+    })()
+  `);
+}
+
+async function domClickDoubaoDurationOption(win: BrowserWindow, seconds: number) {
+  return runPageScript<string>(win, `
+    (() => {
+      const target = ${JSON.stringify(String(seconds))};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4
+          && rect.height > 4
+          && rect.bottom > 0
+          && rect.right > 0
+          && rect.top < window.innerHeight
+          && rect.left < window.innerWidth
+          && style.visibility !== "hidden"
+          && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05
+          && el.getAttribute("aria-hidden") !== "true";
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("data-value"),
+        el.textContent
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\\s+/g, "");
+      const unitRe = new RegExp("(?:^|[^0-9.])" + target + "s(?![0-9])", "i");
+      const secRe = new RegExp("(?:^|[^0-9])" + target + "秒");
+      const insideDurationMenu = (el) => {
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 9; depth += 1, parent = parent.parentElement) {
+          if (!visible(parent)) continue;
+          const rect = parent.getBoundingClientRect();
+          const text = compactText(parent);
+          if (rect.width <= 720
+            && rect.height <= 720
+            && ((text.includes("时长") && /\\d+(?:\\.\\d+)?s/i.test(text))
+              || (text.includes("比例") && text.includes("自动") && text.includes("9:16") && text.includes("16:9")))) {
+            return true;
+          }
+        }
+        return false;
+      };
+      let best = null;
+      for (const el of Array.from(document.querySelectorAll('body *')).filter(visible)) {
+        const compact = compactText(el);
+        const exactUnit = compact === target + "s" || compact === target + "秒";
+        if (!(exactUnit || unitRe.test(compact) || secRe.test(compact) || compact === target)) continue;
+        if (!insideDurationMenu(el)) continue;
+        // Prefer the smallest element whose own text is exactly the target.
+        const rect = el.getBoundingClientRect();
+        if (!best || (exactUnit && rect.width * rect.height < best.area) || (!best.exactUnit && exactUnit)) {
+          best = { el, area: rect.width * rect.height, exactUnit };
+        }
+      }
+      if (!best) return "no-target";
+      const el = best.el;
+      try { el.scrollIntoView({ block: "nearest" }); } catch {}
+      const opts = { bubbles: true, cancelable: true, view: window };
+      // Dispatch at every level of the ancestor chain: a handler that checks
+      // event.target === currentTarget only fires when the dispatch happens
+      // on its own node, so walking the chain covers every binding pattern.
+      const dispatched = [];
+      let node = el;
+      for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+        if (!node.dispatchEvent) break;
+        try { node.dispatchEvent(new PointerEvent("pointerdown", opts)); } catch {}
+        node.dispatchEvent(new MouseEvent("mousedown", opts));
+        try { node.dispatchEvent(new PointerEvent("pointerup", opts)); } catch {}
+        node.dispatchEvent(new MouseEvent("mouseup", opts));
+        node.click();
+        dispatched.push((node.tagName || "?").toLowerCase() + ":" + compactText(node).slice(0, 12));
+        if (!insideDurationMenu(node) && depth > 0) break;
+      }
+      return "clicked:" + dispatched.join(">");
+    })()
+  `);
+}
+
+async function findDoubaoDurationSliderPoint(win: BrowserWindow, seconds: number, currentSeconds: number | null) {
+  return runPageScript<{ x: number; y: number; curX: number; min: number; max: number; debug: string } | null>(win, `
+    (() => {
+      const target = ${JSON.stringify(String(seconds))};
+      const current = ${JSON.stringify(currentSeconds === null ? null : String(currentSeconds))};
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 2 && rect.height > 2
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05;
+      };
+      const textOf = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\\s+/g, "");
+      // Doubao renders duration as a custom slider: a current-value label
+      // ("10s"), the track, and min/max tick labels ("4s" / "15s") — none of
+      // which carry a role attribute. Anchor on the "时长" label instead.
+      let anchor = null;
+      let anchorArea = 0;
+      for (const el of Array.from(document.querySelectorAll('body *')).filter(visible)) {
+        if (compactText(el) !== "时长") continue;
+        const rect = el.getBoundingClientRect();
+        if (!anchor || rect.width * rect.height < anchorArea) {
+          anchor = el;
+          anchorArea = rect.width * rect.height;
+        }
+      }
+      if (!anchor) return null;
+      let section = anchor.parentElement;
+      for (let depth = 0; section && depth < 6; depth += 1, section = section.parentElement) {
+        const labels = Array.from(section.querySelectorAll("*"))
+          .map((el) => compactText(el))
+          .filter((t) => /^\\d+(?:\\.\\d+)?s$/i.test(t));
+        if (labels.length >= 2) break;
+      }
+      if (!section) return null;
+      const values = Array.from(new Set(Array.from(section.querySelectorAll("*"))
+        .map((el) => {
+          const m = compactText(el).match(/^(\\d+(?:\\.\\d+)?)s$/i);
+          return m ? Number(m[1]) : null;
+        })
+        .filter((v) => v !== null)));
+      if (!values.length) return null;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      // The track is a text-free horizontal bar: height 2..16px, width >= 80px.
+      let track = null;
+      for (const el of Array.from(section.querySelectorAll("*"))) {
+        if (!visible(el)) continue;
+        const rect = el.getBoundingClientRect();
+        if (compactText(el)) continue;
+        if (rect.height < 2 || rect.height > 16) continue;
+        if (rect.width < 80 || rect.width < rect.height * 5) continue;
+        if (!track || rect.width > track.getBoundingClientRect().width) track = el;
+      }
+      if (!track) return null;
+      const trackRect = track.getBoundingClientRect();
+      const usable = trackRect.width - 2;
+      const clamp01 = (v) => Math.min(1, Math.max(0, v));
+      const xFor = (value) => Math.round(trackRect.left + 1 + usable * (max === min ? 1 : clamp01((value - min) / (max - min))));
+      const val = Math.min(max, Math.max(min, Number(target)));
+      const y = Math.round(trackRect.top + trackRect.height / 2);
+      return {
+        x: xFor(val),
+        y,
+        curX: current ? xFor(Number(current)) : Math.round(trackRect.left + 1),
+        min,
+        max,
+        debug: "slider-track w=" + Math.round(trackRect.width) + " 范围" + min + "-" + max + "s 目标" + val + "s"
+      };
+    })()
+  `);
+}
+
+async function dumpDoubaoVisibleButtons(win: BrowserWindow) {
+  return runPageScript<string>(win, `
+    (() => {
+      const textOf = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+      const out = [];
+      const seen = new Set();
+      for (const el of Array.from(document.querySelectorAll('button, [role="button"]'))) {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        if (rect.width <= 4 || rect.height <= 4 || style.visibility === "hidden" || style.display === "none") continue;
+        const text = textOf(el).slice(0, 16);
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        out.push(text);
+        if (out.length >= 20) break;
+      }
+      return out.join(" | ") || "无可点击按钮";
+    })()
+  `);
+}
+
+async function dumpDoubaoDurationMenu(win: BrowserWindow) {
+  return runPageScript<string>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && style.visibility !== "hidden" && style.display !== "none"
+          && Number(style.opacity || "1") > 0.05;
+      };
+      const textOf = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+      const compactText = (el) => textOf(el).replace(/\\s+/g, "");
+      let menu = null;
+      for (const el of Array.from(document.querySelectorAll('body *')).filter(visible)) {
+        if (!compactText(el).includes("时长")) continue;
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 9; depth += 1, parent = parent.parentElement) {
+          const rect = parent.getBoundingClientRect();
+          const text = compactText(parent);
+          if (rect.width <= 720 && rect.height <= 720 && (text.includes("比例") || /\\d+s/i.test(text))) {
+            menu = parent;
+            break;
+          }
+        }
+        if (menu) break;
+      }
+      if (!menu) return "未找到设置弹窗容器";
+      const out = [];
+      const seen = new Set();
+      for (const el of Array.from(menu.querySelectorAll("*"))) {
+        if (!visible(el)) continue;
+        const text = textOf(el);
+        if (!text || text.length > 24 || seen.has(text)) continue;
+        seen.add(text);
+        const clickable = el.closest('button, [role="button"], [role="option"], [role="menuitem"], [role="radio"], [role="slider"], [role="tab"], [tabindex]');
+        const role = el.getAttribute && el.getAttribute("role");
+        out.push((clickable ? "[可点]" : "[文本]") + text + "<" + el.tagName.toLowerCase() + (role ? " role=" + role + " now=" + (el.getAttribute("aria-valuenow") || "") : "") + ">");
+        if (out.length >= 16) break;
+      }
+      return out.join(" | ") || "弹窗内无可读文本";
+    })()
+  `);
+}
+
+async function findDoubaoPopoverConfirmPoint(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none" && Number(style.opacity || "1") > 0.05;
+      };
+      const textOf = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, "").trim();
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .filter(visible)
+        .map((el) => ({ el, text: textOf(el), rect: el.getBoundingClientRect() }))
+        .filter((item) => ["确定", "确认", "完成", "保存"].includes(item.text))
+        .filter((item) => item.rect.width < 400 && item.rect.height < 120);
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text
+      };
+    })()
+  `);
+}
+
+async function waitForDoubaoDurationState(
+  win: BrowserWindow,
+  predicate: (state: DoubaoDurationState) => boolean,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  let latest: DoubaoDurationState = { currentDuration: null, summary: null, labels: [] };
+  while (Date.now() < deadline) {
+    try {
+      latest = await inspectSelectedDoubaoDurationState(win);
+      if (predicate(latest)) return latest;
+    } catch {
+      // The page can briefly replace the composer while video mode initializes.
+    }
+    await wait(250);
+  }
+  return latest;
+}
+
+async function findDoubaoDurationTriggerPoint(win: BrowserWindow) {
+  return runPageScript<{ x: number; y: number; debug: string } | null>(win, `
+    (() => {
+      const visible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 4 && rect.height > 4
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== "hidden" && style.display !== "none"
+          && style.pointerEvents !== "none" && Number(style.opacity || "1") > 0.05;
+      };
+      const textOf = (el) => ([
+        el.innerText,
+        el.getAttribute("aria-label"),
+        el.getAttribute("title")
+      ].find((value) => String(value || "").trim()) || "").replace(/\\s+/g, " ").trim();
+      const candidates = Array.from(document.querySelectorAll('body *'))
+        .filter(visible)
+        .map((el) => {
+          const text = textOf(el);
+          const clickable = el.closest('button, [role="button"], [role="combobox"], [role="listbox"], [role="option"], [role="menuitem"], [role="radio"], [role="tab"], [tabindex], [aria-haspopup], [aria-expanded]') || el;
+          const rect = clickable.getBoundingClientRect();
+          return { text, clickable, rect };
+        })
+        .filter((item) => {
+          const compact = item.text.replace(/\\s+/g, "");
+          // The "时长" row label or the current value ("10s") as a dropdown trigger.
+          return (compact.includes("时长") && compact.length <= 16 && compact.length > 2)
+            || /^\\d+(?:\\.\\d+)?s$/i.test(compact);
+        })
+        .filter((item) => item.rect.width < 420 && item.rect.height < 90)
+        .filter((item, index, items) => items.findIndex((c) => c.clickable === item.clickable) === index)
+        .sort((a, b) => b.rect.bottom - a.rect.bottom || a.rect.width * a.rect.height - b.rect.width * b.rect.height);
+      const target = candidates[0];
+      if (!target) return null;
+      return {
+        x: Math.round(target.rect.left + target.rect.width / 2),
+        y: Math.round(target.rect.top + target.rect.height / 2),
+        debug: target.text.slice(0, 30) + " <" + target.clickable.tagName.toLowerCase() + ">"
+      };
+    })()
+  `);
+}
+
+async function waitForDoubaoDurationOptionPoints(
+  win: BrowserWindow,
+  seconds: number,
+  timeoutMs: number
+) {
+  const deadline = Date.now() + timeoutMs;
+  let latest: Array<{ x: number; y: number; debug: string }> = [];
+  while (Date.now() < deadline) {
+    try {
+      const points = await findDoubaoDurationOptionPoints(win, seconds);
+      if (points.length) return points;
+      latest = points;
+    } catch {
+      // Retry while the popover mounts or the page replaces a transient node.
+    }
+    await wait(200);
+  }
+  return latest;
+}
+
+async function selectDoubaoDuration(win: BrowserWindow, seconds: number) {
+  const initial = await waitForDoubaoDurationState(win, (state) => Boolean(state.summary), 2500);
+  if (initial.currentDuration === seconds) {
+    return { before: initial.currentDuration, after: initial.currentDuration, attempts: 0 };
+  }
+
+  const diagnostics: string[] = [];
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await sendKeyboard(win, "Escape", undefined, 180);
+    const before = await waitForDoubaoDurationState(win, (state) => Boolean(state.summary), 1800);
+    if (before.currentDuration === seconds) {
+      return { before: initial.currentDuration, after: before.currentDuration, attempts: attempt - 1 };
+    }
+
+    // The combined "画幅 · 时长" toolbar entry is shared with the aspect ratio
+    // selector, so its locator is reused to open the settings popover.
+    let trigger: Awaited<ReturnType<typeof clickDoubaoAspectRatioTrigger>> = null;
+    try {
+      trigger = await clickDoubaoAspectRatioTrigger(win);
+    } catch {
+      // Retry from a clean menu state below.
+    }
+    if (!trigger) {
+      diagnostics.push(`第 ${attempt} 次未找到工具栏画幅/时长入口（当前 ${before.summary || "未识别"}）`);
+      continue;
+    }
+
+    await sendMouseClick(win, trigger.x, trigger.y);
+    await wait(500);
+    const tried: string[] = [];
+    let applied = false;
+
+    // Primary path: duration is a slider (value label + track + min/max tick
+    // labels). Click the track at the target position, then drag as fallback.
+    const slider = await findDoubaoDurationSliderPoint(win, seconds, before.currentDuration);
+    if (slider) {
+      tried.push(slider.debug);
+      await sendMouseClick(win, slider.x, slider.y);
+      let sliderState = await waitForDoubaoDurationState(
+        win,
+        (state) => state.currentDuration === seconds,
+        1800
+      );
+      if (sliderState.currentDuration === seconds) {
+        applied = true;
+      } else {
+        // Drag from the current value position to the target position.
+        win.webContents.sendInputEvent({ type: "mouseDown", x: slider.curX, y: slider.y, button: "left", clickCount: 1 });
+        await wait(150);
+        const steps = 10;
+        for (let step = 1; step <= steps; step += 1) {
+          const x = Math.round(slider.curX + (slider.x - slider.curX) * (step / steps));
+          win.webContents.sendInputEvent({ type: "mouseMove", x, y: slider.y });
+          await wait(60);
+        }
+        win.webContents.sendInputEvent({ type: "mouseUp", x: slider.x, y: slider.y, button: "left", clickCount: 1 });
+        await wait(200);
+        sliderState = await waitForDoubaoDurationState(
+          win,
+          (state) => state.currentDuration === seconds,
+          2400
+        );
+        if (sliderState.currentDuration === seconds) {
+          applied = true;
+        }
+      }
+    }
+
+    // Legacy fallback: clickable option chips, if the popup exposes them.
+    if (!applied) {
+      const points = await waitForDoubaoDurationOptionPoints(win, seconds, 1600);
+      for (const point of points) {
+        await sendMouseClick(win, point.x, point.y);
+        tried.push(point.debug);
+        let selected = await waitForDoubaoDurationState(
+          win,
+          (state) => state.currentDuration === seconds,
+          1500
+        );
+        if (selected.currentDuration === seconds) {
+          applied = true;
+          break;
+        }
+        const domResult = await domClickDoubaoDurationOption(win, seconds);
+        if (domResult !== "no-target") {
+          tried.push("dom:" + domResult);
+          selected = await waitForDoubaoDurationState(
+            win,
+            (state) => state.currentDuration === seconds,
+            1800
+          );
+          if (selected.currentDuration === seconds) {
+            applied = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (applied) {
+      await sendKeyboard(win, "Escape", undefined, 150);
+      return { before: initial.currentDuration, after: seconds, attempts: attempt };
+    }
+    diagnostics.push(
+      `第 ${attempt} 次入口 ${trigger.debug}，尝试 ${tried.join(" / ") || "无"} 后仍为 ${before.summary || "未识别"}；弹窗内容：${await dumpDoubaoDurationMenu(win)}`
+    );
+  }
+
+  const state = await waitForDoubaoDurationState(win, () => false, 600);
+  throw new Error(
+    `豆包时长未确认：要求 ${seconds} 秒，当前为 ${state.currentDuration ? state.currentDuration + " 秒" : "未识别"}`
+      + `；页面 ${win.webContents.getURL()}`
+      + `；可见档位 ${state.labels.join(" | ") || "无"}`
       + `；${diagnostics.join("；") || "未取得有效操作诊断"}`
   );
 }
@@ -3757,9 +4419,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "执行器未知错误";
 }
 
-function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "prompt">) {
+function formatGenerationSettings(request: Pick<ApiRequest, "model" | "aspectRatio" | "duration" | "prompt">) {
   const model = request.model === "seedance_2_0_mini" ? "mini" : "fast";
-  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${extractPromptDuration(request.prompt) || "未指定"}`;
+  const promptDuration = extractPromptDuration(request.prompt);
+  return `模型：${doubaoVideoModelLabel(model)} 画幅：${request.aspectRatio || "未指定"} 时长：${request.duration ? `${request.duration} 秒` : promptDuration || "未指定"}`;
 }
 
 function extractPromptDuration(prompt: string) {

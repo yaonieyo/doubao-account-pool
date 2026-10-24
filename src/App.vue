@@ -226,7 +226,8 @@ const apiExample = computed(() => {
 curl -X POST http://127.0.0.1:${port}/api/generate \\
   -H "Authorization: Bearer ${token}" \\
   -F "model=seedance_2_0_mini" \\
-  -F "prompt=生成一段 10 秒女性科普动画" \\
+  -F "prompt=生成一段女性科普动画" \\
+  -F "duration=15" \\
   -F "referenceImage=@/Users/your-name/Pictures/ref.png" \\
   -F "removeWatermark=true" \\
   -F "callbackUrl=http://127.0.0.1:3000/doubao/callback"`;
@@ -1146,6 +1147,10 @@ onBeforeUnmount(() => {
           <div>
             <dt>模型</dt>
             <dd>{{ modelLabels[selectedRequest.model] }}</dd>
+          </div>
+          <div>
+            <dt>时长</dt>
+            <dd>{{ selectedRequest.duration ? `${selectedRequest.duration} 秒` : "未指定" }}</dd>
           </div>
           <div>
             <dt>账号</dt>
