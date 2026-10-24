@@ -4,6 +4,19 @@ import os from 'node:os'
 import path from 'node:path'
 import { app } from 'electron'
 
+// Windows 下 Chromium profile（如 DIPS）在窗口销毁后仍被短暂锁定，直接删目录会 EBUSY，重试吸收释放延迟
+function rmSyncWithRetry(target, options, attempts = 8) {
+  for (let i = 0; ; i++) {
+    try {
+      return fs.rmSync(target, options)
+    } catch (error) {
+      if (i >= attempts - 1 || !['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error.code)) throw error
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250)
+    }
+  }
+}
+
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'doubao-quota-'))
 app.setPath('userData', root)
 app.whenReady().then(async () => {
@@ -190,6 +203,7 @@ app.whenReady().then(async () => {
     db.stopApiRequestAndRefund(task.requestId); assert.equal(db.getAccount(other.id).quotaRemaining, 10)
   })
   console.log('QUOTA_RESULTS ' + JSON.stringify(results))
-  fs.rmSync(root, { recursive: true, force: true })
+  try { rmSyncWithRetry(root, { recursive: true, force: true }) }
+  catch (cleanupError) { console.error('PROFILE_RM_FAIL', cleanupError.code, String(cleanupError.message).slice(0, 140)) }
   app.exit(results.every(item => item.ok) ? 0 : 1)
 }).catch(error => { console.error(error); app.exit(1) })
